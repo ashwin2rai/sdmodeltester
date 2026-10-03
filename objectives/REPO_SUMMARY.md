@@ -7,7 +7,7 @@
 
 ## What this repository is
 
-This repository is a deliberately small image-generation test harness for **Stable Diffusion 1.5 and SDXL single-file `.safetensors` checkpoints**. It is inspired by `videomodeltests`, but it is intentionally narrower and simpler.
+This repository is a deliberately small image-generation test harness for **Stable Diffusion 1.5 and SDXL single-file `.safetensors` checkpoints**. It is inspired by `videomodeltests` found at https://github.com/ashwin2rai/videomodeltests, but it is intentionally narrower and simpler.
 
 The repository contains a real inference backend, a CLI, a tiny HTTP server, and a browser UI. However, **the backend is not the product by itself**. Its main purpose is to make a Stable Diffusion checkpoint easy to load once on a Google Colab L4, keep resident in GPU memory, and then drive repeatedly from a lightweight web UI exposed through Colab's built-in kernel proxy.
 
