@@ -50,7 +50,7 @@ uv run python -m src.cli generate --mock --model-family sd15 --prompt "a {white 
     --seed 123 --images 4 --output-dir outputs
 uv run python -m src.cli generate --model-family sdxl --model models/x.safetensors \
     --prompt "portrait, (white hair:1.2)" --image inputs/src.png --strength 0.6
-uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # server: Phase 5
+uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # then open :8000
 ```
 
 Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength`) use the

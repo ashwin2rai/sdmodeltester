@@ -56,8 +56,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 1b | Owner corrections: round dims to ×8, quietly raise img2img steps | committed |
 | 2 | Mock backend + shared MicroBatcher (OOM fallback) | committed |
 | 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | committed; Colab-only parts pending Phase 8 |
-| 4 | CLI: doctor / generate / serve | **done — awaiting owner review/commit** (`serve` waits for Phase 5's `src/server.serve`) |
-| 5 | Queue + HTTP API | not started |
+| 4 | CLI: doctor / generate / serve | committed |
+| 5 | Queue + HTTP API | **done — awaiting owner review/commit** (`index.html` is a placeholder until Phase 6) |
 | 6 | UI (`src/static/index.html`) | not started |
 | 7 | Local/mock verification | not started |
 | 8 | L4 tuning + `compat/known-good-colab.md` | needs Colab |
@@ -89,10 +89,15 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `collect_diagnostics(mock, model, family, compile_check) -> list[Check]`, `format_checks`,
   `cmd_doctor` / `cmd_generate` / `cmd_serve`, `UsageError`. `serve` calls
   `src.server.serve(backend, host, port, inputs_dir, outputs_dir)`; Phase 5 must provide it.
-- Tests: `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
+- `src/server.py` (Phase 5): `ServerState(backend, inputs_dir, outputs_dir, max_queue, echo)`
+  with `start/stop/enqueue/clear_queue/status/log/log_since/is_busy`; `JobRecord`;
+  `create_app(state)`; `serve(backend, host, port, inputs_dir, outputs_dir)`;
+  `request_from_json`, `list_files`, `safe_child`, `secure_delete`, `clear_directory`,
+  `format_seeds`; `MAX_QUEUE = 5`. `src/static/index.html` is a placeholder.
+- Tests: `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
   `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
   `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
-  (1 module skipped); 178 pass with `--group inference-cpu` in ~15 s (133 without torch).
+  (1 module skipped); 210 pass with `--group inference-cpu` in ~18 s.
   `make_request()` helper lives in `test_seeds.py`.
 
 ## Decisions made
@@ -216,6 +221,47 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `--mock-load-seconds 2.0`, `--mock-step-seconds 0.05`, `--optimization`.
 - Tests use a fake torch namespace (patched via `cli._import_torch` / `_module_available` /
   `_version`) to simulate L4, other GPUs and no CUDA. Never patch `importlib` globally.
+
+### Phase 5 decisions (server)
+
+- **Threads**: Flask (threaded) + `backend-loader` + `gpu-worker`, all daemons. The loader
+  runs `load()` then `warmup()`, then sets state `ready` and the `ready` Event. On failure it
+  sets state `error`, stores `backend_error`, marks pending jobs failed, and sets `ready`
+  too, so the worker wakes and fails its waiting job. `/api/queue` then returns 503.
+- **Worker** takes a job off the queue straight away (even while loading) and makes it
+  `current` with status `waiting_for_model`, so `queue_length` counts *pending* jobs only.
+  `MAX_QUEUE = 5` pending, so up to 6 jobs exist in total. Full queue → **429**.
+- Job statuses: queued, waiting_for_model, running, done, error, cancelled (and "failed" for
+  pending jobs drained on load error). `latest_completed_job` changes only when a job
+  succeeds completely; on a mid-job error the partial PNGs stay in `outputs/` and are logged.
+- **Status JSON** = the SPEC §17 fields + `latest_completed_job.seeds/prompts` +
+  `current_job.num_images` + `log` (entries `{seq, text}` after `?log_after=N`; server
+  keeps 300 lines). The browser should poll with the last seq it saw. `/api/config` also
+  returns `max_queue`.
+- **Log lines** (terminal is timestamped, browser gets plain text): server online, backend
+  state messages, `Queued job N (waiting for model): K image(s), seeds A–B`, corrections,
+  the per-job settings line, per-image prompts when dynamic choices differ, saved files,
+  done/errors. Per-step progress goes only in `current_job.message/progress`, not the log.
+  Werkzeug request logging is set to WARNING (no line for every poll). The real backend's
+  `log` attribute is redirected into the server log.
+- **Queue JSON** (`POST /api/queue`): fields as in `GenerationRequest`; missing ones use the
+  family defaults; `input_image` is a bare filename in `inputs/` (checked with
+  `secure_filename` + exists + extension); `strength` is dropped for txt2img and `null` →
+  default for img2img. Response: `job_id, seeds, prompts, corrections, queue_length,
+  waiting_for_model`. Errors: 400 validation (JSON `{"error": msg}`), 429 full, 503 backend error.
+- Listings: `{"files": [...]}`, newest first by mtime; inputs = png/jpg/jpeg/webp/bmp, outputs = png.
+  Symlinks and other files are ignored. `inputs_mtime`/`outputs_mtime` = directory mtimes.
+- **Upload**: multipart field `file`, max 50 MB, `secure_filename` (empty → `upload.png`),
+  extension allow-list, saved to a hidden `.upload-<uuid>.part` temp file, checked with
+  Pillow `verify()`, then renamed to a collision-safe name.
+- **Reuse output**: copies the original PNG bytes into `inputs/` (`name_1.png` on collision).
+- **Clear-all**: 409 if a job is current or the queue is non-empty (checked under the lock).
+  Overwrites with random bytes + fsync, then unlinks every regular file in inputs/ and
+  outputs/, *except `.gitkeep`*. Skips symlinks and subdirectories. Resets the latest job.
+- Test helper `GatedBackend` (in `test_server.py`) blocks load/generate on Events for
+  deterministic thread tests. The server tests passed 15/15 repeated runs.
+- **Phase 6 notes**: the UI should use relative URLs (`api/status`, not `/api/status`) so
+  it works behind path-prefixed proxies.
 
 ### Needs Colab (Phase 8) — cannot be verified locally
 
