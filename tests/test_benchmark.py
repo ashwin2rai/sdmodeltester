@@ -182,9 +182,31 @@ def test_cli_benchmark_in_process(tmp_path):
     assert out == [str(tmp_path / "report.md")]
     assert "| | baseline | compile |" in report and "18/18 passed." in report
     data = json.loads((tmp_path / "report.json").read_text())
-    assert [r["profile"] for r in data] == ["baseline", "compile"]
-    assert "checks" in data[0] and "checks" not in data[1]  # verify ran once
-    assert (tmp_path / "out" / "functional_contact_sheet.png").is_file()
+    assert [r["profile"] for r in data["results"]] == ["baseline", "compile"]
+    assert "checks" in data["results"][0] and "checks" not in data["results"][1]
+    assert data["contact_sheet"] == str(
+        (tmp_path / "out" / "functional_contact_sheet.png").resolve()
+    )
+    assert Path(data["contact_sheet"]).is_file()
+    assert data["report"] == str((tmp_path / "report.md").resolve())
+    assert (data["checks_passed"], data["checks_total"]) == (18, 18)
+    assert data["recommended_profile"] in ("baseline", "compile")
+
+
+def test_cli_benchmark_quiet_prints_only_report_path(tmp_path, capfd):
+    import subprocess
+    import sys
+
+    argv = bench_argv(tmp_path, "--profiles", "baseline,compile", "--quiet")
+    proc = subprocess.run(
+        [sys.executable, "-m", "src.cli", *argv],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(tmp_path / "report.md")
+    assert proc.stderr == ""  # children are quiet too
 
 
 def test_cli_benchmark_subprocess_per_profile(tmp_path):

@@ -33,8 +33,7 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   transformers bounds in `requirements-inference.txt`); also jax 0.11.1, numba 0.61.2,
   pandas 2.2.3. The torch version wasn't listed; `doctor` / Phase 8 must record it.
 - Setup: `uv sync` then `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`.
-  Everything incl. optional groups: `uv run --all-groups pytest` (~100 s, 304 tests at Phase 9a;
-  243 pass + 3 modules skipped without optional groups).
+  Everything incl. optional groups: `uv run --all-groups pytest` (~100 s, 306 tests at Phase 9a).
 - **Optional UI test stack**: `ui` group = playwright (1.63). Chromium headless shell in
   `~/.cache/ms-playwright` (~270 MB) via `playwright install chromium --only-shell`; the
   Codespace needed system libs once: `sudo .venv/bin/playwright install-deps
@@ -101,11 +100,11 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `parse_civitai_url`, `download_url` (.part + Range resume + SHA256), `resolve_civitai`,
   `pick_civitai_file`, `civitai_family_warning`, `read_safetensors_header`, `guess_family`,
   `validate_checkpoint`, `fetch_checkpoint`, `runtime_preflight`, `run`, `install_requirements`,
-  `start_server`/`stop_server`/`port_open`/`server_status`/`follow_log`/`tail`, `show_ui`,
-  `run_streaming`, `zip_outputs`.
-- `notebooks/colab.ipynb` (Phase 9a): 9 code cells (1 Settings, 2 Get code + GPU check,
-  3 Install + doctor, 4 Download model, 5 Start server + UI, 6 Log, 7 Zip outputs,
-  8 Benchmark, 9 Stop) + intro markdown.
+  `start_server`/`stop_server`/`port_open`, `show_ui`, `zip_outputs`, `LiveLine`,
+  `run_benchmark`, `show_benchmark`.
+- `notebooks/colab.ipynb` (Phase 9a): 8 code cells (1 Settings, 2 Get code + GPU check,
+  3 Install + doctor, 4 Download model, 5 Start server + UI, 6 Zip outputs, 7 Benchmark,
+  8 Stop) + intro and "Optional" markdown.
 - `src/benchmark.py` (Phase 8a): `benchmark_profile(backend, family, out, profile, steps, size,
   alt_size, log)`, `functional_checks(...) -> list[Check]`, `contact_sheet`, `recommend`,
   `render_report`, `is_black`, `max_pixel_diff`, `default_report_name`. CLI: `cmd_benchmark`
@@ -377,6 +376,25 @@ Reviewed `je4ngomes/fast-stable-diffusion/fast_stable_diffusion_AUTOMATIC1111_py
 
 ### Phase 9a decisions (Colab notebook)
 
+- **Owner decision — the notebook is a quiet orchestrator, "deaf" to the UI.** It sets
+  variables, downloads the model, starts the server and shows the UI; it never prints
+  prompts, images, job details or server log lines. (This deliberately overrides
+  COLAB_COMPATIBILITY §11 F "stdout/stderr visible or tailed into the notebook": backend
+  progress/errors are shown by the UI's status pill/progress area instead, and the full log
+  is in `/content/sdmodeltester/server.log`.) Each setup cell prints one ✓ line; details only
+  on failure (`cu.run` quiet helper) plus ⚠️ warnings. Download uses `cu.LiveLine` (one
+  updating line via an IPython display handle; WARNING/ERROR lines are printed and stay).
+  `test_notebook.py` checks that no notebook output contains the prompt, seed, "Queued job",
+  "Backend:" or "Job 1".
+- **Coupling** (verified): the notebook never imports `src/`; `colab_utils` doesn't import
+  `src/`; `src/` has no Colab code paths. Interfaces: the CLI (`doctor` / `serve` / `benchmark
+  --quiet` flags and exit codes), the benchmark JSON summary (absolute `report`,
+  `contact_sheet`, `recommended_profile`, `checks_passed/total`, `results`), and the
+  `requirements*.txt` files. The notebook doesn't choose the benchmark output dir (default
+  `outputs/benchmark`; the JSON says where the contact sheet is).
+- `benchmark --quiet`: no progress on stderr, children run with captured output, stdout is
+  only the report path. The JSON summary was changed from a list to a dict (`results` holds
+  the per-profile list).
 - **Self-contained + shareable** (owner requirement): the notebook only needs the public repo
   (`https://github.com/ashwin2rai/sdmodeltester`, default branch `main`; confirmed public).
   Cell 2 clones (or updates in place: `fetch --depth 1 origin REF` + `checkout --force
@@ -407,8 +425,10 @@ Reviewed `je4ngomes/fast-stable-diffusion/fast_stable_diffusion_AUTOMATIC1111_py
   `start_new_session`), refuses if the port is busy, waits for the port, and shows the log tail
   on failure. `stop_server` reaps the child with `waitpid(WNOHANG)`: a zombie still "exists"
   for `killpg(pid, 0)`, which made stopping take the full 15 s timeout (bug found by tests).
-  `follow_log` streams `server.log` until `/api/status` says ready/error (or timeout 30 min);
-  cell 5 prints a one-line verdict.
+  Cell 5 prints only "✓ UI running" (plus the full-tab proxy link line from `show_ui`).
+- Removed `follow_log`, `tail`, `server_status`, `run_streaming` (unused after the
+  quiet redesign). Bug found by tests: the contact-sheet path in the JSON was relative to the
+  CLI's cwd (the repo); the notebook kernel's cwd is `/content`. It's now written absolute.
 - **UI**: `show_ui` → `google.colab.output.serve_kernel_port_as_iframe(port, height=1100)`
   plus a best-effort full-tab link via `eval_js("google.colab.kernel.proxyPort(port)")`.
 - **Drive**: optional `SAVE_MODELS_TO_DRIVE` mounts Drive and keeps models in
@@ -416,8 +436,9 @@ Reviewed `je4ngomes/fast-stable-diffusion/fast_stable_diffusion_AUTOMATIC1111_py
 - **Demo mode** (`DEMO_MODE`): `--mock` everywhere (doctor, serve, benchmark), no model or GPU
   needed. Lets people try the UI and lets `test_notebook.py` run the real cells end to end
   (fake remote = a temporary git repo of the working tree; `install_requirements` stubbed).
-- Cell 8 (benchmark) stops the server first (VRAM), writes `compat/benchmark-<family>.md`,
-  renders it and the contact sheet; the user re-runs cell 5 afterwards.
+- Cell 7 (benchmark) stops the server first (VRAM), runs `cu.run_benchmark` (CLI `--quiet`,
+  default report path `compat/benchmark-<family>-<date>.md`), renders the report + contact
+  sheet; the user re-runs cell 5 afterwards.
 - **Editing the notebook**: it was generated by a builder script in the session scratchpad
   (not kept). To change it, load the JSON and replace a cell's `source` (cells are found by
   their `# @title N ·` line), then rerun `tests/test_notebook.py`. Ruff lints the notebook

@@ -30,7 +30,6 @@ import struct
 import subprocess
 import sys
 import time
-import urllib.request
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -586,29 +585,37 @@ def fetch_checkpoint(
 # ---------------------------------------------------------------------------
 
 
-def runtime_preflight(log: Printer = print) -> dict[str, Any]:
-    """Report Colab's own Python/torch/GPU before installing anything (no torch upgrade)."""
-    info: dict[str, Any] = {"python": sys.version.split()[0]}
-    log(f"Python:          {info['python']}")
+def runtime_preflight() -> dict[str, Any]:
+    """Inspect Colab's own Python/torch/GPU (never installs or upgrades anything).
+
+    Returns ``python, torch, cuda, gpu, vram_gib`` plus a one-line ``summary`` and a list
+    of ``warnings`` for the notebook to print.
+    """
+    info: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "torch": None,
+        "cuda": False,
+        "gpu": None,
+        "vram_gib": None,
+        "warnings": [],
+    }
     try:
         import torch
     except ImportError:
-        log("PyTorch:         not installed — this notebook expects Colab's preinstalled torch")
-        info["torch"] = None
-        return info
-    info["torch"] = torch.__version__
-    info["cuda"] = torch.cuda.is_available()
-    log(f"PyTorch:         {torch.__version__}")
-    log(f"CUDA available:  {'yes' if info['cuda'] else 'no'}")
-    if info["cuda"]:
-        props = torch.cuda.get_device_properties(0)
-        info["gpu"], info["vram_gib"] = props.name, round(props.total_memory / 2**30, 1)
-        log(f"GPU:             {props.name} · {info['vram_gib']} GiB")
-        if "L4" not in props.name:
-            log("WARNING: this notebook is tuned for an NVIDIA L4; other GPUs may need "
-                "smaller batches or resolutions.")  # fmt: skip
+        info["warnings"].append("PyTorch is not installed; this expects Colab's preinstalled torch")
     else:
-        log("ERROR: no GPU. Runtime → Change runtime type → select a GPU (L4), then rerun.")
+        info["torch"] = torch.__version__
+        info["cuda"] = torch.cuda.is_available()
+        if info["cuda"]:
+            props = torch.cuda.get_device_properties(0)
+            info["gpu"], info["vram_gib"] = props.name, round(props.total_memory / 2**30, 1)
+            if "L4" not in props.name:
+                info["warnings"].append(
+                    "tuned for an NVIDIA L4; other GPUs may need smaller batches or sizes"
+                )
+    gpu = f"{info['gpu']} ({info['vram_gib']} GiB)" if info["gpu"] else "no GPU"
+    torch_text = f"torch {info['torch']}" if info["torch"] else "no torch"
+    info["summary"] = f"Python {info['python']} · {torch_text} · {gpu}"
     return info
 
 
@@ -632,8 +639,11 @@ def torch_version() -> str | None:
         return None
 
 
-def install_requirements(repo_dir: Path, log: Printer = print) -> None:
-    """pip-install app + inference deps on top of Colab's stack; never replace torch."""
+def install_requirements(repo_dir: Path, log: Printer = print) -> str | None:
+    """pip-install app + inference deps on top of Colab's stack; never replace torch.
+
+    Silent on success (returns the torch version); warns if pip changed torch anyway.
+    """
     before = torch_version()
     run(
         [
@@ -648,8 +658,7 @@ def install_requirements(repo_dir: Path, log: Printer = print) -> None:
         log(f"WARNING: pip changed torch {before} → {after}. Restart the runtime "
             "(Runtime → Restart session) and report this; the notebook must not replace "
             "Colab's torch.")  # fmt: skip
-    else:
-        log(f"Installed requirements (torch {after} left untouched)")
+    return after
 
 
 # ---------------------------------------------------------------------------
@@ -742,63 +751,6 @@ def _wait(predicate: Callable[[], bool], timeout: float, interval: float = 0.2) 
     return predicate()
 
 
-def server_status(port: int) -> dict[str, Any] | None:
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as r:
-            return json.loads(r.read())
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def follow_log(
-    log_file: Path,
-    *,
-    port: int | None = None,
-    until_ready: bool = True,
-    timeout: float = 900,
-    poll: float = 1.0,
-    log: Printer = print,
-) -> str:
-    """Print new server-log lines until the backend is ready/errored (or ``timeout``).
-
-    Returns the final backend state ('ready', 'error', 'timeout', 'stopped').
-    """
-    position = 0
-    deadline = time.monotonic() + timeout
-    state = "timeout"
-    while time.monotonic() < deadline:
-        if log_file.exists():
-            with open(log_file) as fh:
-                fh.seek(position)
-                for line in fh.read().splitlines():
-                    if line.strip():
-                        log(line)
-                position = fh.tell()
-        if port is not None and until_ready:
-            status = server_status(port)
-            if status is None and not port_open(port):
-                state = "stopped"
-                break
-            if status and status.get("backend_state") in ("ready", "error"):
-                state = status["backend_state"]
-                time.sleep(poll)  # let the final lines land in the log
-                if log_file.exists():
-                    with open(log_file) as fh:
-                        fh.seek(position)
-                        for line in fh.read().splitlines():
-                            if line.strip():
-                                log(line)
-                break
-        time.sleep(poll)
-    return state
-
-
-def tail(log_file: Path, lines: int = 40) -> str:
-    if not log_file.exists():
-        return "(no log yet)"
-    return "\n".join(log_file.read_text().splitlines()[-lines:])
-
-
 def show_ui(port: int, height: int = 1100, log: Printer = print) -> None:
     """Embed the UI with Colab's built-in kernel proxy (iframe helper; SPEC §21.8)."""
     try:
@@ -814,23 +766,6 @@ def show_ui(port: int, height: int = 1100, log: Printer = print) -> None:
         log(f"Open in a new tab (only works while this notebook is open): {url}")
     except Exception:  # noqa: BLE001 — iframe is the supported baseline
         pass
-
-
-def run_streaming(cmd: Sequence[str], *, cwd: Path | None = None, log: Printer = print) -> int:
-    """Run ``cmd``, printing its combined output line by line as it arrives."""
-    process = subprocess.Popen(
-        list(cmd),
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-    assert process.stdout is not None
-    for line in process.stdout:
-        log(line.rstrip("\n"))
-    return process.wait()
 
 
 def zip_outputs(outputs_dir: Path, archive_base: Path, log: Printer = print) -> Path | None:
@@ -850,3 +785,87 @@ def zip_outputs(outputs_dir: Path, archive_base: Path, log: Printer = print) -> 
     except ImportError:
         pass
     return archive
+
+
+# ---------------------------------------------------------------------------
+# Quiet notebook output
+# ---------------------------------------------------------------------------
+
+
+class LiveLine:
+    """A printer that keeps a single, updating status line in Colab/Jupyter.
+
+    Lines starting with WARNING/ERROR are printed permanently; everything else replaces
+    the previous status. Outside IPython it simply prints.
+    """
+
+    def __init__(self) -> None:
+        self._handle = None
+        try:
+            from IPython import get_ipython
+            from IPython.display import Pretty, display
+
+            if get_ipython() is not None:
+                self._pretty = Pretty
+                self._handle = display(Pretty(""), display_id=True)
+        except ImportError:
+            pass
+
+    def __call__(self, message: str) -> None:
+        if self._handle is None or message.startswith(("WARNING", "ERROR")):
+            print(message)
+        else:
+            self._handle.update(self._pretty(message))
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (Phase 8) from the notebook
+# ---------------------------------------------------------------------------
+
+
+def run_benchmark(
+    repo_dir: Path,
+    family: str,
+    *,
+    model_path: Path | None,
+    profiles: str = "baseline,compile",
+    functional: bool = True,
+    mock: bool = False,
+) -> dict[str, Any]:
+    """Run ``src.cli benchmark --quiet`` and return its JSON summary.
+
+    The CLI prints only the report path; the JSON next to it names the contact sheet.
+    """
+    cmd = [
+        sys.executable, "-m", "src.cli", "benchmark", "--quiet",
+        "--model-family", family, "--profiles", profiles,
+    ]  # fmt: skip
+    cmd += ["--mock"] if mock else ["--model", str(model_path)]
+    if not functional:
+        cmd.append("--no-functional")
+    result = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
+    lines = result.stdout.strip().splitlines()
+    report = Path(repo_dir) / lines[-1] if lines else None
+    if report is None or not report.with_suffix(".json").is_file():
+        print((result.stderr or result.stdout)[-4000:])
+        raise RuntimeError(f"benchmark failed (exit code {result.returncode})")
+    summary = json.loads(report.with_suffix(".json").read_text())
+    summary["exit_code"] = result.returncode
+    summary["report"] = str(report)
+    if summary.get("contact_sheet"):
+        summary["contact_sheet"] = str(Path(repo_dir) / summary["contact_sheet"])
+    return summary
+
+
+def show_benchmark(summary: dict[str, Any]) -> None:
+    """Render the benchmark report (and contact sheet) in the notebook."""
+    report = Path(summary["report"])
+    sheet = summary.get("contact_sheet")
+    try:
+        from IPython.display import Image, Markdown, display
+
+        display(Markdown(report.read_text()))
+        if sheet and Path(sheet).is_file():
+            display(Image(filename=sheet))
+    except ImportError:
+        print(report.read_text())

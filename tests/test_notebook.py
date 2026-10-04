@@ -35,7 +35,7 @@ def test_notebook_structure():
     assert nb["metadata"]["accelerator"] == "GPU"
     titles = [title(src) for src in code_cells()]
     assert [t.split("·")[0].replace("# @title", "").strip() for t in titles] == [
-        str(i) for i in range(1, 10)
+        str(i) for i in range(1, 9)
     ]
     for cell in nb["cells"]:
         if cell["cell_type"] == "code":
@@ -123,9 +123,23 @@ def test_demo_mode_end_to_end(tmp_path, capsys):
     cells = {title(src).split("·")[0].replace("# @title", "").strip(): src for src in code_cells()}
     ns: dict = {"__name__": "__notebook__"}
     port = free_port()
+    outputs = []
 
     def run(number):
         exec(compile(cells[number], f"<cell {number}>", "exec"), ns)
+        outputs.append(capsys.readouterr().out)
+        return outputs[-1]
+
+    def wait_ready():
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                if http_json(f"http://127.0.0.1:{port}/api/status")["backend_state"] == "ready":
+                    return
+            except OSError:
+                pass
+            time.sleep(0.2)
+        raise AssertionError("server never became ready")
 
     saved_path = list(sys.path)
     try:
@@ -137,43 +151,55 @@ def test_demo_mode_end_to_end(tmp_path, capsys):
             REPO_URL=make_fake_remote(tmp_path),
             REPO_REF="main",
         )
-        run("2")  # clone + preflight (CPU is fine in demo mode)
+        out = run("2")  # clone + preflight (CPU is fine in demo mode)
+        assert out.startswith("✓ Code ") and "Python " in out
         repo = Path(ns["REPO_DIR"])
         assert (repo / "src" / "cli.py").is_file()
-        ns["cu"].install_requirements = lambda *a, **k: print("(pip install skipped in test)")
-        run("3")  # doctor --mock
-        run("4")
+        ns["cu"].install_requirements = lambda *a, **k: "test"
+        assert run("3").strip() == "✓ Installed and checked (torch test untouched)"
+        assert run("4").strip() == "✓ Demo mode: no model needed"
         assert ns["MODEL_PATH"] is None
-        run("5")  # start server + follow log until ready
-        out = capsys.readouterr().out
-        assert "Model ready" in out
-        assert "Server online" in out
+        out = run("5")
+        assert out.strip().endswith("✓ UI running")
+        wait_ready()
 
         # use the running server like the UI would
-        job = http_json(f"http://127.0.0.1:{port}/api/queue", {"prompt": "a {red | blue} fox"})
+        prompt = "a {crimson | azure} fox wearing goggles"
+        job = http_json(f"http://127.0.0.1:{port}/api/queue", {"prompt": prompt, "seed": 987654})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            status = http_json(f"http://127.0.0.1:{port}/api/status")
-            latest = status["latest_completed_job"]
+            latest = http_json(f"http://127.0.0.1:{port}/api/status")["latest_completed_job"]
             if latest and latest["id"] == job["job_id"]:
                 break
             time.sleep(0.2)
         assert latest and len(latest["outputs"]) == 1
 
-        run("6")
-        assert "ready · 0 queued" in capsys.readouterr().out
-        run("7")
+        out = run("6")
         assert (tmp_path / "content" / "sdmodeltester-outputs.zip").is_file()
 
         run("2")  # re-running the setup cell updates in place
-        run("5")  # ...and restarting the server replaces the old one
-        assert "Model ready" in capsys.readouterr().out
+        out = run("5")  # ...and restarting the server replaces the old one
+        assert out.strip().endswith("✓ UI running")
+        wait_ready()
+
+        ns["PROFILES"] = "baseline"  # keep the demo benchmark short
+        cells["7"] = cells["7"].replace('PROFILES = "baseline,compile"', 'PROFILES = "baseline"')
+        out = run("7")
+        assert "Report:" in out and "18/18 passed." in out
+        assert Path(ns["BENCHMARK"]["contact_sheet"]).is_file()
     finally:
         if "cu" in ns and "PID_FILE" in ns:
-            run("9")
+            outputs.append("")
+            exec(compile(cells["8"], "<cell 8>", "exec"), ns)
+            outputs.append(capsys.readouterr().out)
         sys.path[:] = saved_path
         sys.modules.pop("colab_utils", None)
-    assert "Stopped server" in capsys.readouterr().out
+    assert outputs[-1].strip() in ("✓ UI stopped", "The UI was not running.")
+
+    # The notebook is "deaf" to the UI: no prompts, server log lines or job details.
+    everything = "\n".join(outputs)
+    for leaked in ("crimson", "azure", "goggles", "Queued job", "Backend:", "Job 1", "987654"):
+        assert leaked not in everything, leaked
 
 
 @pytest.mark.parametrize("family", ["sd15", "sdxl"])

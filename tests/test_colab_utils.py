@@ -521,10 +521,33 @@ def test_get_secret_fallbacks(monkeypatch):
     assert cu.get_secret("SDMT_TEST_TOKEN") == "from-env"
 
 
-def test_runtime_preflight_reports():
-    logs = []
-    info = cu.runtime_preflight(log=logs.append)
-    assert info["python"] and logs[0].startswith("Python:")
+def test_runtime_preflight_is_silent_and_summarises(capsys):
+    info = cu.runtime_preflight()
+    assert capsys.readouterr().out == ""
+    assert info["summary"].startswith(f"Python {info['python']} · ")
+    assert isinstance(info["warnings"], list) and info["cuda"] in (True, False)
+    if not info["cuda"]:
+        assert info["summary"].endswith("no GPU")
+
+
+def test_live_line_prints_outside_ipython(capsys):
+    line = cu.LiveLine()
+    line("downloading 1%")
+    line("WARNING: family mismatch")
+    out = capsys.readouterr().out
+    assert "downloading 1%" in out and "WARNING: family mismatch" in out
+
+
+def test_install_requirements_is_silent_and_guards_torch(monkeypatch, tmp_path):
+    calls, logs = [], []
+    monkeypatch.setattr(cu, "run", lambda cmd, what, cwd=None: calls.append(cmd) or "")
+    versions = iter(["2.11.0", "2.11.0"])
+    monkeypatch.setattr(cu, "torch_version", lambda: next(versions))
+    assert cu.install_requirements(tmp_path, log=logs.append) == "2.11.0"
+    assert logs == [] and "-r" in calls[0]
+    versions = iter(["2.11.0", "2.12.0"])
+    cu.install_requirements(tmp_path, log=logs.append)
+    assert "pip changed torch 2.11.0 → 2.12.0" in logs[0]
 
 
 def free_port():
@@ -533,7 +556,16 @@ def free_port():
         return s.getsockname()[1]
 
 
+def api_status(port):
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as r:
+        return json.loads(r.read())
+
+
 def test_server_lifecycle_with_mock(tmp_path):
+    import time
+
     port = free_port()
     log_file, pid_file = tmp_path / "server.log", tmp_path / "server.pid"
     cmd = [
@@ -547,13 +579,11 @@ def test_server_lifecycle_with_mock(tmp_path):
             cmd, cwd=REPO_ROOT, log_file=log_file, pid_file=pid_file, port=port, log=logs.append
         )
         assert cu.port_open(port) and pid_file.is_file()
-        lines = []
-        state = cu.follow_log(log_file, port=port, timeout=30, poll=0.2, log=lines.append)
-        assert state == "ready"
-        assert any("Server online" in line for line in lines)
-        assert any("Backend: ready" in line for line in lines)
-        assert cu.server_status(port)["backend_state"] == "ready"
-        assert "Backend: ready" in cu.tail(log_file)
+        deadline = time.monotonic() + 30
+        while api_status(port)["backend_state"] != "ready" and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert api_status(port)["backend_state"] == "ready"
+        assert "Backend: ready" in log_file.read_text()  # server logs go to the file only
 
         # restarting stops the old process first
         cu.start_server(
@@ -578,26 +608,6 @@ def test_server_start_failure_shows_log(tmp_path):
             **QUIET,
         )
     assert "boom: bad config" in str(info.value)
-
-
-def test_follow_log_reports_backend_error(tmp_path):
-    port = free_port()
-    log_file, pid_file = tmp_path / "server.log", tmp_path / "server.pid"
-    cmd = [
-        sys.executable, "-m", "src.cli", "serve", "--model-family", "sd15",
-        "--model", str(tmp_path / "x.safetensors"), "--port", str(port),
-    ]  # fmt: skip
-    (tmp_path / "x.safetensors").write_bytes(SD15)
-    try:
-        cu.start_server(
-            cmd, cwd=REPO_ROOT, log_file=log_file, pid_file=pid_file, port=port, **QUIET
-        )
-        lines = []
-        state = cu.follow_log(log_file, port=port, timeout=60, poll=0.2, log=lines.append)
-        assert state == "error"  # no CUDA/diffusers here: load fails, server stays up
-        assert any("Backend error" in line for line in lines)
-    finally:
-        cu.stop_server(pid_file, port, **QUIET)
 
 
 def test_show_ui_outside_colab():

@@ -85,10 +85,13 @@ capability), 2 invalid arguments or request.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ashwin2rai/sdmodeltester/blob/main/notebooks/colab.ipynb)
 
-`notebooks/colab.ipynb` is self-contained and shareable: it clones this repo, installs only
-the app-level libraries on top of Colab's own Python/CUDA/PyTorch (it never reinstalls
-torch), runs `doctor`, downloads one checkpoint, starts the server, and embeds the UI with
-Colab's built-in kernel proxy (no ngrok/Cloudflare).
+`notebooks/colab.ipynb` is self-contained and shareable. It is only an orchestrator: it
+clones this repo, installs the app-level libraries on top of Colab's own Python/CUDA/PyTorch
+(it never reinstalls torch), runs `doctor`, downloads one checkpoint, starts
+`python -m src.cli serve` in the background, and embeds the UI with Colab's built-in kernel
+proxy (no ngrok/Cloudflare). It talks to the app only through the CLI, and stays quiet: one
+✓ line per cell, details only on failure, and never any prompts, images or server log
+(that goes to `server.log`; loading progress and errors show in the UI itself).
 
 - **Model sources**: Hugging Face file links (`hf_hub_download`), Civitai model pages or
   download links (resolved through the Civitai API, SHA256-verified), direct URLs, or a
@@ -97,7 +100,7 @@ Colab's built-in kernel proxy (no ngrok/Cloudflare).
 - **Tokens**: Colab Secrets `HF_TOKEN` / `CIVITAI_TOKEN` are used first, so shared copies
   of the notebook never contain anyone's token.
 - **Demo mode** runs the whole UI with placeholder images on any runtime (no GPU/model).
-- Cell 8 runs the Phase 8 benchmark and shows the report + contact sheet.
+- Cell 7 runs the Phase 8 benchmark (`benchmark --quiet`) and shows the report + contact sheet.
 
 Notebook helpers live in `notebooks/colab_utils.py` (operational code, not part of `src/`).
 `requirements-inference.txt` intentionally does **not** list torch — see

@@ -131,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--output-dir", type=Path, default=Path("outputs/benchmark"))
     bench.add_argument("--report", type=Path, help="Markdown report path (default: compat/…)")
     bench.add_argument("--in-process", action="store_true", help="run all profiles in this process")
+    bench.add_argument(
+        "--quiet",
+        action="store_true",
+        help="no progress output; print only the report path (the JSON next to it lists "
+        "the contact sheet)",
+    )
     bench.add_argument("--child-json", type=Path, help=argparse.SUPPRESS)
 
     serve = sub.add_parser("serve", help="run the HTTP server and browser UI")
@@ -365,10 +371,12 @@ def _run_profile_subprocess(
         if not verify:
             cmd.append("--no-functional")
         err(f"benchmark: starting {profile} in a fresh process")
-        code = subprocess.run(cmd).returncode
+        child = subprocess.run(cmd, capture_output=args.quiet, text=True)
         if child_json.is_file():
             return json.loads(child_json.read_text())
-        return {"profile": profile, "error": f"process exited with code {code}"}
+        detail = (child.stderr or "").strip().splitlines()[-1:] if args.quiet else []
+        error = f"process exited with code {child.returncode}"
+        return {"profile": profile, "error": ": ".join([error, *detail])}
 
 
 def _strip_profile_args(argv: Sequence[str]) -> list[str]:
@@ -402,10 +410,14 @@ def cmd_benchmark(args: argparse.Namespace, out: Printer, err: Printer) -> int:
     run_functional = not args.no_functional
 
     if args.child_json:  # internal: one profile, results as JSON for the parent
+        if args.quiet:
+            err = lambda message: None  # noqa: E731
         result = _run_profile(args, profiles[0], run_functional, err)
         args.child_json.write_text(json.dumps(result))
         return EXIT_OK
 
+    if args.quiet:
+        err = lambda message: None  # noqa: E731 — progress and report echo suppressed
     results = []
     child_argv = _strip_profile_args(args.raw_argv)
     for profile in profiles:
@@ -446,7 +458,15 @@ def cmd_benchmark(args: argparse.Namespace, out: Printer, err: Printer) -> int:
     report_path = args.report or Path("compat") / benchmark.default_report_name(args.model_family)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report)
-    report_path.with_suffix(".json").write_text(json.dumps(results, indent=2))
+    summary = {
+        "report": str(report_path.resolve()),
+        "contact_sheet": str(sheet.resolve()) if sheet else None,
+        "recommended_profile": benchmark.recommend(perf)[0] if perf else None,
+        "checks_passed": None if checks is None else sum(c.ok for c in checks),
+        "checks_total": None if checks is None else len(checks),
+        "results": results,
+    }
+    report_path.with_suffix(".json").write_text(json.dumps(summary, indent=2))
     out(str(report_path))
     err(report)
     failed_checks = checks is not None and not all(c.ok for c in checks)
