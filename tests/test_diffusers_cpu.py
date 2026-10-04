@@ -447,3 +447,37 @@ def test_compile_failure_at_setup_falls_back(monkeypatch):
     backend.load()
     assert backend.active_optimization == "baseline"
     backend.warmup()
+
+
+# ---------------------------------------------------------------------------
+# CLI real path (tiny pipeline injected in place of from_single_file)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_generate_real_backend(tmp_path, monkeypatch):
+    import src.cli as cli
+
+    def tiny_backend(family, model, **kwargs):
+        kwargs.update(device="cpu", dtype="float32", warmup_size=(SIZE, SIZE), warmup_steps=1)
+        return DiffusersBackend(family, model, pipeline_loader=BUILDERS[family], **kwargs)
+
+    monkeypatch.setattr(cli, "DiffusersBackend", tiny_backend)
+    model = tmp_path / "tiny.safetensors"
+    model.touch()
+    out, err = [], []
+    code = cli.main(
+        [
+            "generate",
+            "--model-family", "sdxl",
+            "--model", str(model),
+            "--prompt", "a (red:1.3) {cat | dog}",
+            "--width", "64", "--height", "64", "--steps", "2",
+            "--images", "2", "--seed", "7",
+            "--output-dir", str(tmp_path / "out"),
+        ],
+        out=out.append,
+        err=err.append,
+    )  # fmt: skip
+    assert code == 0, err
+    assert [Path(p).name.split("_")[-1] for p in out] == ["seed7.png", "seed8.png"]
+    assert any("Loaded tiny.safetensors (sdxl)" in line for line in err)

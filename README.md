@@ -41,13 +41,22 @@ Note: a plain `uv sync` / `uv run` removes the optional group again (uv syncs ex
 `requirements.txt` / `requirements-inference.txt` remain for the Colab notebook, which
 installs on top of Colab's own Python and PyTorch.
 
-Planned commands (not implemented yet):
+## CLI
 
 ```bash
-uv run python -m src.cli doctor
-uv run python -m src.cli serve --mock --model-family sdxl --port 8000
-uv run python -m src.cli generate --mock --model-family sd15 --prompt "a {white | black} cat"
+uv run python -m src.cli doctor --mock                       # mock-mode requirements only
+uv run python -m src.cli doctor --model models/x.safetensors --model-family sdxl --compile-check
+uv run python -m src.cli generate --mock --model-family sd15 --prompt "a {white | black} cat" \
+    --seed 123 --images 4 --output-dir outputs
+uv run python -m src.cli generate --model-family sdxl --model models/x.safetensors \
+    --prompt "portrait, (white hair:1.2)" --image inputs/src.png --strength 0.6
+uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # server: Phase 5
 ```
+
+Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength`) use the
+model family's defaults. `generate` prints output paths on stdout and progress on stderr.
+Exit codes: 0 success, 1 runtime/load failure (or `doctor` found a missing required
+capability), 2 invalid arguments or request.
 
 ## Real inference (Colab L4)
 

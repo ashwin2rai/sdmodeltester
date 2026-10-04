@@ -55,8 +55,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 1 | Core pure-Python: validation, family literal, seeds, dynamic prompts, preprocess, filenames | committed |
 | 1b | Owner corrections: round dims to ×8, quietly raise img2img steps | committed |
 | 2 | Mock backend + shared MicroBatcher (OOM fallback) | committed |
-| 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | **done locally — awaiting owner review/commit**; Colab-only parts pending Phase 8 |
-| 4 | CLI: doctor / generate / serve | not started |
+| 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | committed; Colab-only parts pending Phase 8 |
+| 4 | CLI: doctor / generate / serve | **done — awaiting owner review/commit** (`serve` waits for Phase 5's `src/server.serve`) |
 | 5 | Queue + HTTP API | not started |
 | 6 | UI (`src/static/index.html`) | not started |
 | 7 | Local/mock verification | not started |
@@ -84,10 +84,15 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `DEFAULT_OPTIMIZATION`, `WARMUP_STEPS`, `configure_cuda_allocator()`, `make_scheduler()`,
   `DiffusersBackend(family, model_path, device, dtype, optimization, warmup_steps,
   warmup_size, log, pipeline_loader)`.
-- Tests: `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
+- `src/cli.py` (Phase 4): `main(argv, out, err) -> exit code`, `build_parser`,
+  `build_backend(args, log, mock_delays)`, `build_request(args)`, `check_model_path`,
+  `collect_diagnostics(mock, model, family, compile_check) -> list[Check]`, `format_checks`,
+  `cmd_doctor` / `cmd_generate` / `cmd_serve`, `UsageError`. `serve` calls
+  `src.server.serve(backend, host, port, inputs_dir, outputs_dir)`; Phase 5 must provide it.
+- Tests: `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
   `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
   `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
-  (1 module skipped); 152 pass with `--group inference-cpu` in ~15 s.
+  (1 module skipped); 178 pass with `--group inference-cpu` in ~15 s (133 without torch).
   `make_request()` helper lives in `test_seeds.py`.
 
 ## Decisions made
@@ -184,6 +189,33 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 - **Warm-up**: txt2img, batch 1, `WARMUP_STEPS = 3` steps, at the family default size
   (overridable by `warmup_size`), output discarded.
 - CPU tests lower `MIN_DIMENSION` to 64 via monkeypatch (tiny models at 256 px took 5 min).
+
+### Phase 4 decisions (CLI)
+
+- **Exit codes**: 0 ok; 1 runtime failure (backend load error, generation error, or `doctor`
+  found a required capability missing); 2 usage/validation error (argparse also uses 2).
+- `--model-family` is required for generate/serve (no auto), optional for doctor. Real mode
+  needs `--model` pointing at an existing `.safetensors` file; mock defaults the name to
+  `mock.safetensors`.
+- Unset knobs come from `FAMILY_DEFAULTS`. `--strength` without `--image` is ignored with a
+  note; `--image` without `--strength` uses the family default 0.6.
+- `generate`: output paths go to **stdout** (one per line, scriptable); everything else
+  (notes, corrections, "Job 1: …" summary, resolved per-image prompts when they differ,
+  progress about every 10%, errors) goes to **stderr**. Job id is always 1. Warm-up is
+  only run for non-baseline optimization (to trigger the compile fallback).
+- `configure_cuda_allocator()` is called in `build_backend` (real) and doctor's GPU checks,
+  before torch is first imported.
+- **doctor**: `--mock` checks only Python/Flask/Pillow and never imports torch. Real mode
+  *fails* on: torch missing, CUDA unavailable, FP16 CUDA alloc failing, diffusers or
+  transformers missing, a given checkpoint missing or not `.safetensors`. It *warns* on:
+  non-L4 GPU, SDPA/channels_last/torch.compile unavailable, compile smoke failing,
+  accelerate/safetensors missing. `--compile-check` runs a tiny `torch.compile` smoke test
+  (otherwise "not-run"). Package versions come from `importlib.metadata` (no imports).
+- Hidden flags `--device` / `--dtype` (default cuda/float16) exist for debugging.
+- `serve` flags: `--host 127.0.0.1`, `--port 8000`, `--inputs-dir`, `--outputs-dir`,
+  `--mock-load-seconds 2.0`, `--mock-step-seconds 0.05`, `--optimization`.
+- Tests use a fake torch namespace (patched via `cli._import_torch` / `_module_available` /
+  `_version`) to simulate L4, other GPUs and no CUDA. Never patch `importlib` globally.
 
 ### Needs Colab (Phase 8) — cannot be verified locally
 
