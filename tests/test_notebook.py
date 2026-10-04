@@ -40,7 +40,8 @@ def test_no_secrets_and_spec_settings():
         assert line in settings
     for forbidden in ("ngrok", "cloudflared", "--upgrade torch", "xformers", "--mock"):
         assert forbidden not in text
-    assert 'cu.get_secret("HF_TOKEN", HF_TOKEN)' in CELLS[2]
+    assert 'cu.get_token("HF_TOKEN", HF_TOKEN)' in CELLS[2]
+    assert 'cu.get_token("CIVITAI_TOKEN", CIVITAI_TOKEN)' in CELLS[2]
 
 
 def test_notebook_only_uses_existing_helpers():

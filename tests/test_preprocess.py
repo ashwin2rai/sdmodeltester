@@ -1,4 +1,4 @@
-"""Input images are cover-resized and center-cropped, never stretched (SPEC §11)."""
+"""Input images are cover-resized and center-cropped, never stretched (SPEC §7)."""
 
 from PIL import Image, ImageDraw
 

@@ -2,7 +2,7 @@
 
 ``python -m src.cli benchmark`` runs this on the Colab L4 and writes a Markdown report
 (fields of ``compat/known-good-colab.md``) plus a contact sheet of every functional-check
-image for visual review (SPEC §13.4, §23; COLAB_COMPATIBILITY §3). It only uses the public
+image for visual review (SPEC §3, §13). It only uses the public
 backend contract, so the mock and tiny CPU pipelines exercise it locally.
 """
 
@@ -79,7 +79,7 @@ def max_pixel_diff(a: Path, b: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Performance (SPEC §23.2)
+# Performance (SPEC §13)
 # ---------------------------------------------------------------------------
 
 
@@ -156,7 +156,7 @@ def recommend(results: dict[str, dict[str, Any]]) -> tuple[str | None, str]:
 
 
 # ---------------------------------------------------------------------------
-# Functional matrix (SPEC §23.1)
+# Functional matrix (SPEC §13)
 # ---------------------------------------------------------------------------
 
 

@@ -2,7 +2,7 @@
 #
 # Do NOT list torch here: Colab owns Python, CUDA and PyTorch.
 # Version bounds are provisional until Phase 8 L4 verification;
-# see objectives/COLAB_COMPATIBILITY.md §2-3.
+# see objectives/SPEC.md §3.
 diffusers
 transformers
 accelerate

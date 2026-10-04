@@ -1,6 +1,6 @@
 """Helpers for notebooks/colab.ipynb: install, checkpoint download, server launch.
 
-Notebook-only operational code (SPEC §21.1). The app itself is only driven through
+Notebook-only operational code (SPEC §12). The app itself is only driven through
 ``python -m src.cli``; nothing here imports ``src``.
 """
 
@@ -17,7 +17,7 @@ import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 MIN_CHECKPOINT_BYTES = 500 * 2**20  # anything smaller is a LoRA/embedding, not a checkpoint
 
@@ -26,15 +26,20 @@ class DownloadError(RuntimeError):
     pass
 
 
-def get_secret(name: str, fallback: str = "") -> str:
-    """Colab Secrets (🔑 sidebar) first, then the form value, then the environment."""
-    try:
-        from google.colab import userdata  # type: ignore[import-not-found]
+def get_token(name: str, value: str = "") -> str:
+    """The token typed in the notebook, else the Colab Secret ``name``, else ``$name``.
 
-        value = userdata.get(name)
-    except Exception:  # noqa: BLE001 — not in Colab, no such secret, or access denied
-        value = None
-    return (value or fallback or os.environ.get(name, "")).strip()
+    A pasted ``?token=…`` prefix (the Civitai URL form) is accepted too.
+    """
+    value = re.sub(r"^\??token=", "", value.strip())
+    if not value:
+        try:
+            from google.colab import userdata  # type: ignore[import-not-found]
+
+            value = userdata.get(name) or ""
+        except Exception:  # noqa: BLE001 — not in Colab, no such secret, or access denied
+            value = ""
+    return (value or os.environ.get(name, "")).strip()
 
 
 def run(cmd: list[str], what: str, cwd: Path | None = None) -> None:
@@ -62,7 +67,7 @@ def install_requirements(repo_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint download (SPEC §21.5)
+# Checkpoint download (SPEC §12)
 # ---------------------------------------------------------------------------
 
 
@@ -73,7 +78,7 @@ def fetch_checkpoint(url: str, models_dir: Path, *, hf_token: str = "", civitai_
     if host in ("huggingface.co", "hf.co"):
         path = _hf_download(url, models_dir, hf_token)
     elif "civitai" in host:
-        path = download(civitai_download_url(url), models_dir, civitai_token)
+        path = download(civitai_download_url(url, civitai_token), models_dir)
     elif host:
         path = download(url, models_dir)
     else:
@@ -95,35 +100,48 @@ def _hf_download(url: str, models_dir: Path, token: str) -> Path:
     ))  # fmt: skip
 
 
-def civitai_download_url(url: str) -> str:
-    """Model page ``…/models/1?modelVersionId=2`` or ``…/api/download/models/2`` -> download URL."""
+def civitai_download_url(url: str, token: str = "") -> str:
+    """Model page ``…/models/1?modelVersionId=2`` or ``…/api/download/models/2`` -> download
+    URL, with the API token as ``?token=`` (Civitai's documented download form)."""
     parsed = urlparse(url)
+    query = parse_qs(parsed.query)
     if "/api/download/models/" in parsed.path:
-        return url
-    if version_id := parse_qs(parsed.query).get("modelVersionId"):
-        return (
-            f"https://civitai.com/api/download/models/{version_id[0]}?type=Model&format=SafeTensor"
+        base = parsed._replace(query="").geturl()
+    elif "modelVersionId" in query:
+        base = f"https://civitai.com/api/download/models/{query.pop('modelVersionId')[0]}"
+        query = {"type": ["Model"], "format": ["SafeTensor"]}
+    else:
+        raise DownloadError(
+            "Civitai link must include the version: open the model page, pick the version, "
+            "and copy the URL with ?modelVersionId=… (or the version's download link)"
         )
-    raise DownloadError(
-        "Civitai link must include the version: open the model page, pick the version, and "
-        "copy the URL with ?modelVersionId=… (or the version's download link)"
-    )
+    query.pop("token", None)
+    if token:
+        query["token"] = [token]
+    return f"{base}?{urlencode(query, doseq=True)}" if query else base
 
 
-def download(url: str, dest_dir: Path, token: str = "") -> Path:
-    """Stream to ``<name>.part`` and rename when complete. The Bearer token is dropped by
-    requests when a redirect leaves the host (e.g. Civitai -> its storage CDN)."""
+def download(url: str, dest_dir: Path) -> Path:
+    """Stream to ``<name>.part`` and rename when complete. Errors never echo the URL, which
+    may carry a token."""
     import requests
 
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    with requests.get(url, headers=headers, stream=True, timeout=60) as response:
+    try:
+        return _download(requests, url, Path(dest_dir))
+    except requests.RequestException as exc:
+        raise DownloadError(f"download failed ({type(exc).__name__}); try again") from None
+
+
+def _download(requests, url: str, dest_dir: Path) -> Path:
+    with requests.get(url, stream=True, timeout=60) as response:
         if response.status_code in (401, 403):
-            raise DownloadError(f"access denied ({response.status_code}): this model needs a "
-                                "token (Colab Secrets HF_TOKEN / CIVITAI_TOKEN)")  # fmt: skip
-        response.raise_for_status()
+            raise DownloadError(f"access denied (HTTP {response.status_code}): this model needs "
+                                "a token (CIVITAI_TOKEN / HF_TOKEN)")  # fmt: skip
+        if response.status_code >= 400:
+            raise DownloadError(f"download failed (HTTP {response.status_code})")
         if response.headers.get("Content-Type", "").startswith("text/html"):
             raise DownloadError("the link returned a web page, not a file")
-        final = Path(dest_dir) / _filename(response)
+        final = dest_dir / _filename(response)
         total = int(response.headers.get("Content-Length") or 0)
         if final.is_file() and final.stat().st_size == total:
             return final
@@ -170,7 +188,7 @@ def validate_checkpoint(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Server (SPEC §21.7-21.8)
+# Server (SPEC §12)
 # ---------------------------------------------------------------------------
 
 

@@ -47,7 +47,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def send(data: bytes, content_type="application/octet-stream", disposition=None, auth=False):
     def handler(h):
-        if auth and h.headers["Authorization"] != "Bearer secret":
+        if auth and "token=secret" not in h.path:
             h.send_response(401)
             h.end_headers()
             return
@@ -93,15 +93,17 @@ def small_checkpoints(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("url", "expected"),
+    ("url", "token", "expected"),
     [
-        ("https://civitai.com/api/download/models/12?type=Model", "https://civitai.com/api/download/models/12?type=Model"),
-        ("https://civitai.com/models/7/cool?modelVersionId=99",
-         "https://civitai.com/api/download/models/99?type=Model&format=SafeTensor"),
+        ("https://civitai.com/api/download/models/12", "", "https://civitai.com/api/download/models/12"),
+        ("https://civitai.com/api/download/models/12?type=Model&token=old", "abc",
+         "https://civitai.com/api/download/models/12?type=Model&token=abc"),
+        ("https://civitai.com/models/7/cool?modelVersionId=99", "abc",
+         "https://civitai.com/api/download/models/99?type=Model&format=SafeTensor&token=abc"),
     ],
 )  # fmt: skip
-def test_civitai_download_url(url, expected):
-    assert cu.civitai_download_url(url) == expected
+def test_civitai_download_url(url, token, expected):
+    assert cu.civitai_download_url(url, token) == expected
 
 
 def test_civitai_url_without_version_is_rejected():
@@ -128,12 +130,25 @@ def test_filename_from_signed_url_and_path(web, tmp_path):
     assert cu.download(a + "/plain.safetensors", tmp_path).name == "plain.safetensors"
 
 
-def test_token_is_not_forwarded_to_other_host(web, tmp_path):
+def test_civitai_token_reaches_civitai_but_not_storage(web, tmp_path):
     routes, seen, a, b = web
-    routes["/api/download/models/1"] = redirect(f"{b}/storage")
+    routes["/api/download/models/1"] = redirect(f"{b}/storage?signed=1")
     routes["/storage"] = send(CKPT, disposition='attachment; filename="c.safetensors"')
-    cu.download(a + "/api/download/models/1", tmp_path, token="secret")
-    assert dict(seen) == {"/api/download/models/1": "Bearer secret", "/storage": None}
+    url = cu.civitai_download_url(a + "/api/download/models/1", "secret")
+    assert cu.download(url, tmp_path).name == "c.safetensors"
+    assert [path for path, _ in seen] == [
+        "/api/download/models/1?token=secret",
+        "/storage?signed=1",
+    ]
+
+
+def test_errors_never_echo_the_token(web, tmp_path):
+    _, _, a, _ = web
+    dead = f"http://127.0.0.1:{free_port()}"
+    for url in (a + "/missing?token=secret", dead + "/x?token=secret"):
+        with pytest.raises(cu.DownloadError) as info:
+            cu.download(url, tmp_path)
+        assert "secret" not in str(info.value) and info.value.__cause__ is None
 
 
 @pytest.mark.parametrize(
@@ -193,12 +208,13 @@ def test_fetch_checkpoint_routes_by_host(web, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_get_secret_fallbacks(monkeypatch):
+def test_get_token_precedence(monkeypatch):
     monkeypatch.delenv("SDMT_TEST_TOKEN", raising=False)
-    assert cu.get_secret("SDMT_TEST_TOKEN") == ""
-    assert cu.get_secret("SDMT_TEST_TOKEN", " typed ") == "typed"
+    assert cu.get_token("SDMT_TEST_TOKEN") == ""
     monkeypatch.setenv("SDMT_TEST_TOKEN", "env")
-    assert cu.get_secret("SDMT_TEST_TOKEN") == "env"
+    assert cu.get_token("SDMT_TEST_TOKEN") == "env"
+    assert cu.get_token("SDMT_TEST_TOKEN", " typed ") == "typed"  # notebook value wins
+    assert cu.get_token("SDMT_TEST_TOKEN", "?token=abc123") == "abc123"  # pasted URL form
 
 
 def test_install_requirements_warns_if_torch_changes(monkeypatch, tmp_path, capsys):

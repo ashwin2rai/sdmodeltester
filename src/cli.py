@@ -7,7 +7,7 @@
     python -m src.cli benchmark --model-family sdxl --model models/x.safetensors
 
 Mock mode never imports torch. Real mode sets the CUDA allocator config before torch is
-first imported (SPEC §13.2).
+first imported (SPEC §8).
 """
 
 from __future__ import annotations
@@ -271,7 +271,7 @@ def cmd_benchmark(args: argparse.Namespace, out: Printer, err: Printer) -> int:
 
 
 # ---------------------------------------------------------------------------
-# doctor (COLAB_COMPATIBILITY §4)
+# doctor (SPEC §11)
 # ---------------------------------------------------------------------------
 
 

@@ -30,7 +30,7 @@ MODEL_FAMILIES: tuple[str, ...] = get_args(ModelFamily)
 
 Mode = Literal["txt2img", "img2img"]
 
-# Public sampler IDs are application-owned (SPEC §8); never Diffusers class names.
+# Public sampler IDs are application-owned (SPEC §5); never Diffusers class names.
 SAMPLERS: tuple[tuple[str, str], ...] = (
     ("dpmpp_2m_karras", "DPM++ 2M Karras"),
     ("dpmpp_2m_sde_karras", "DPM++ 2M SDE Karras"),
@@ -42,7 +42,7 @@ SAMPLERS: tuple[tuple[str, str], ...] = (
 SAMPLER_IDS: tuple[str, ...] = tuple(sid for sid, _ in SAMPLERS)
 SAMPLER_LABELS: dict[str, str] = dict(SAMPLERS)
 
-# Sampler ID -> (diffusers scheduler class name, from_config overrides). SPEC §8.
+# Sampler ID -> (diffusers scheduler class name, from_config overrides). SPEC §5.
 # Overrides are explicit (incl. use_karras_sigmas=False) so settings in the checkpoint's
 # own scheduler config can't silently turn e.g. "Euler" into "Euler Karras".
 SAMPLER_SCHEDULERS: dict[str, tuple[str, dict[str, Any]]] = {
@@ -413,7 +413,7 @@ def denoising_steps(req: GenerationRequest) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Micro-batching with OOM fallback (SPEC §14.3) — shared by mock and real backends
+# Micro-batching with OOM fallback (SPEC §8) — shared by mock and real backends
 # ---------------------------------------------------------------------------
 
 T = TypeVar("T")
@@ -541,7 +541,7 @@ class _BatchedBackend:
 
 
 # ---------------------------------------------------------------------------
-# Mock backend (SPEC §15): no torch, no diffusers, no network, no GPU
+# Mock backend (SPEC §8): no torch, no diffusers, no network, no GPU
 # ---------------------------------------------------------------------------
 
 
@@ -631,7 +631,7 @@ class MockBackend(_BatchedBackend):
 
 
 def save_png(image: Image.Image, path: Path) -> None:
-    """Save as PNG with no generation metadata (no text chunks, no EXIF; SPEC §12.2)."""
+    """Save as PNG with no generation metadata (no text chunks, no EXIF; SPEC §7)."""
     # Copy pixels into a fresh image so no ``info`` (text, EXIF, ICC) carries over.
     clean = Image.new(image.mode, image.size)
     clean.paste(image)
@@ -639,10 +639,10 @@ def save_png(image: Image.Image, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Real Diffusers backend (SPEC §6, §13, §14). torch/diffusers imported lazily.
+# Real Diffusers backend (SPEC §4, §8). torch/diffusers imported lazily.
 # ---------------------------------------------------------------------------
 
-# Optimization profiles compared in Phase 8 (SPEC §13.4). "baseline" = FP16 + SDPA.
+# Optimization profiles compared in Phase 8 (SPEC §8, §13). "baseline" = FP16 + SDPA.
 OPTIMIZATION_PROFILES: tuple[str, ...] = ("baseline", "compile", "compile-max")
 DEFAULT_OPTIMIZATION = "baseline"  # until Phase 8 L4 benchmarks pick a winner
 WARMUP_STEPS = 3
@@ -754,7 +754,7 @@ class DiffusersBackend(_BatchedBackend):
                 pipe, safety_checker=None, requires_safety_checker=False
             )
         img2img = diffusers.StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
-        img2img.watermark = None  # SPEC §6.4: never watermark
+        img2img.watermark = None  # SPEC §4: never watermark
         return img2img
 
     # -- optional acceleration -----------------------------------------------
@@ -878,7 +878,7 @@ class DiffusersBackend(_BatchedBackend):
             [spec.prompt for spec in batch],
             [spec.negative_prompt for spec in batch],
         )
-        # One generator per image: an image depends only on its own seed (SPEC §10).
+        # One generator per image: an image depends only on its own seed (SPEC §7).
         generators = [torch.Generator(device=self.device).manual_seed(s.seed) for s in batch]
 
         def callback(pipeline: Any, step_index: int, _timestep: Any, kwargs: dict) -> dict:

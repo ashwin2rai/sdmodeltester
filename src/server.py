@@ -1,7 +1,7 @@
 """Flask server: queue, backend-loader thread, GPU worker thread, filesystem API.
 
 The HTTP server starts immediately; the model loads/optimizes/warms in a background
-thread (SPEC §13.5, §16). Jobs may be queued at any time before a fatal load error and
+thread (SPEC §8, §9). Jobs may be queued at any time before a fatal load error and
 run one at a time on a single worker.
 """
 

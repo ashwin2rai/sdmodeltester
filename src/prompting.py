@@ -5,12 +5,12 @@ Dynamic syntax::
     a man with {white | black | silver} hair
     a man with {(white:1.2) | black} hair
 
-Rules (SPEC §9.1): one brace level only, at least two non-empty alternatives
+Rules (SPEC §6): one brace level only, at least two non-empty alternatives
 per group, alternatives are whitespace-trimmed, several groups per prompt are
-allowed. Choices are made with a PRNG derived from the image seed (SPEC §9.2),
+allowed. Choices are made with a PRNG derived from the image seed (SPEC §6),
 never with the diffusion generator.
 
-Weighted syntax (SPEC §9.3)::
+Weighted syntax (SPEC §6)::
 
     (white hair:1.2)    (background:0.7)
 

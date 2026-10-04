@@ -15,7 +15,7 @@ src/                     application code (backend, prompting, server, CLI, UI, 
 notebooks/               Colab notebook + its helper module
 tests/                   test suite — runs without torch/diffusers/GPU
 models/ inputs/ outputs/ runtime data (git-ignored)
-objectives/              spec, Colab compatibility policy, development status
+objectives/              SPEC.md (requirements + decisions), status.md (progress)
 ```
 
 ## Local development (mock mode, no GPU)
@@ -100,7 +100,7 @@ server log is in `/content/sdmodeltester/server.log`.
 
 Helpers live in `notebooks/colab_utils.py` (notebook-only, never imported by `src/`).
 `requirements-inference.txt` intentionally does **not** list torch — see
-[`objectives/COLAB_COMPATIBILITY.md`](objectives/COLAB_COMPATIBILITY.md).
+[`objectives/SPEC.md`](objectives/SPEC.md) §3.
 
 ## License
 
