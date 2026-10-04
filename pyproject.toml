@@ -15,13 +15,26 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
 ]
+inference-cpu = [
+    "torch",
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "safetensors",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra -m 'not gpu'"
+filterwarnings = [
+    # numpy 2 deprecations raised inside diffusers schedulers (inference-cpu group only)
+    "ignore::DeprecationWarning:diffusers.*",
+    "ignore::DeprecationWarning:numpy.*",
+]
 markers = [
     "gpu: requires CUDA, torch, diffusers and a real checkpoint (excluded by default)",
+    "torch: real backend on CPU with tiny random models (skipped unless the inference-cpu group is installed)",
 ]
 
 [tool.ruff]
@@ -31,3 +44,19 @@ extend-exclude = ["objectives", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+
+# ---------------------------------------------------------------------------
+# uv: optional CPU-only inference stack for local tests of the real backend
+# with tiny random models (no checkpoints). Not needed for the normal suite.
+#   uv sync --group inference-cpu
+# ---------------------------------------------------------------------------
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

@@ -29,6 +29,15 @@ uv run ruff check . && uv run ruff format --check .
 ```
 
 The normal test suite never needs torch, diffusers, CUDA, or a model download.
+
+Optionally, the real Diffusers backend can be exercised on CPU with tiny random SD1.5/SDXL
+pipelines built from configs (no checkpoint or network; CPU-only torch, ~190 MB):
+
+```bash
+uv run --group inference-cpu pytest     # adds tests/test_diffusers_cpu.py (~15 s)
+```
+
+Note: a plain `uv sync` / `uv run` removes the optional group again (uv syncs exactly).
 `requirements.txt` / `requirements-inference.txt` remain for the Colab notebook, which
 installs on top of Colab's own Python and PyTorch.
 

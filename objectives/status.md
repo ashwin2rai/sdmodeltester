@@ -16,7 +16,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   *data*: no SD checkpoints, no big test images (keep any test data to a few MB at most;
   prefer generating images in-test with Pillow).
 - **Libraries/tools are fine:** install Python packages and dev tools freely without asking;
-  make the best decision. (Still never install torch/diffusers here — no GPU, and they are huge.)
+  make the best decision. CPU-only torch + diffusers are installed via the optional
+  `inference-cpu` group for tiny-model tests (never the CUDA torch build: several GB).
 - **Use uv** for Python environment/dependency management.
 - **Priority:** build and test everything that works in mock / representative tests first.
   Real-GPU work (Phase 8) and the Colab notebook (Phase 9) come last and need Colab.
@@ -32,6 +33,12 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   transformers bounds in `requirements-inference.txt`); also jax 0.11.1, numba 0.61.2,
   pandas 2.2.3. The torch version wasn't listed; `doctor` / Phase 8 must record it.
 - Setup: `uv sync` then `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`.
+- **Optional CPU inference stack**: `uv run --group inference-cpu pytest` (torch 2.14.1+cpu,
+  diffusers 0.40.0, transformers 5.18.0 at time of writing). torch comes from the
+  `pytorch-cpu` index (`[tool.uv.sources]`), *never* PyPI's CUDA build. uv syncs exactly,
+  so a plain `uv run`/`uv sync` uninstalls the group; reinstalling takes ~40 s from cache.
+  To check the torch-free suite without disturbing `.venv`:
+  `UV_PROJECT_ENVIRONMENT=<scratch>/venv-notorch uv run pytest`.
 - Dev deps are in `[dependency-groups] dev` (pytest, ruff). App deps (flask, pillow) are in
   `[project] dependencies` and mirrored in `requirements.txt` for the Colab notebook.
   `uv.lock` is generated and should be committed.
@@ -44,11 +51,11 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 
 | Step | Description | State |
 |---|---|---|
-| 0 | Repo setup (layout, manifests, pyproject, README, gitignore, status) | done (owner committing) |
-| 1 | Core pure-Python: validation, family literal, seeds, dynamic prompts, preprocess, filenames | done |
-| 1b | Owner corrections: round dims to ×8, quietly raise img2img steps | done |
-| 2 | Mock backend + shared MicroBatcher (OOM fallback) | **done — awaiting owner review/commit** |
-| 3 | Real Diffusers backend (code only; lazy imports; untestable here beyond import guards) | not started |
+| 0 | Repo setup (layout, manifests, pyproject, README, gitignore, status) | committed |
+| 1 | Core pure-Python: validation, family literal, seeds, dynamic prompts, preprocess, filenames | committed |
+| 1b | Owner corrections: round dims to ×8, quietly raise img2img steps | committed |
+| 2 | Mock backend + shared MicroBatcher (OOM fallback) | committed |
+| 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | **done locally — awaiting owner review/commit**; Colab-only parts pending Phase 8 |
 | 4 | CLI: doctor / generate / serve | not started |
 | 5 | Queue + HTTP API | not started |
 | 6 | UI (`src/static/index.html`) | not started |
@@ -56,11 +63,13 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 8 | L4 tuning + `compat/known-good-colab.md` | needs Colab |
 | 9 | Colab notebook | needs Colab, last |
 
-## What exists (Phase 1)
+## What exists
 
 - `src/prompting.py`: `parse_template`, `validate_template`, `resolve_template`,
   `resolve_prompt_pair(prompt, negative, seed)`, `prompt_rng(seed)` (seed XOR
-  `PROMPT_RNG_SALT`), `PromptSyntaxError`. Weighted-embedding adapter not yet written.
+  `PROMPT_RNG_SALT`), `PromptSyntaxError`. Phase 3: `parse_weighted`, `weighted_token_ids`,
+  `chunk_count`, `chunk_tokens`, `CHUNK_TOKENS` (pure) and `encode_prompt_batch(pipe, family,
+  prompts, negatives)` (torch, lazy) returning the pipeline embedding kwargs.
 - `src/backend.py`: `ModelFamily`, `MODEL_FAMILIES`, `check_family`, `SAMPLERS` /
   `SAMPLER_IDS` / `SAMPLER_LABELS`, `FAMILY_DEFAULTS`, `GenerationRequest` (+ `.mode`),
   `ResolvedImageSpec`, `ResolvedGenerationJob` (+ `job_id`, `.seeds`), `GenerationResult`,
@@ -71,8 +80,15 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `warmup`, `generate`), `StatusCallback = (state, message)`,
   `ProgressCallback = (fraction 0..1, message)`, `GenerationError(message, completed_paths)`,
   `denoising_steps(req)`, `MicroBatcher`, `MockBackend`, `MockOutOfMemory`, `save_png`.
+- Phase 3 additions in `src/backend.py`: `SAMPLER_SCHEDULERS`, `OPTIMIZATION_PROFILES`,
+  `DEFAULT_OPTIMIZATION`, `WARMUP_STEPS`, `configure_cuda_allocator()`, `make_scheduler()`,
+  `DiffusersBackend(family, model_path, device, dtype, optimization, warmup_steps,
+  warmup_size, log, pipeline_loader)`.
 - Tests: `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
-  `test_preprocess.py`, `test_mock_backend.py` — 98 passing. `make_request()` helper lives in `test_seeds.py`.
+  `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
+  `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
+  (1 module skipped); 152 pass with `--group inference-cpu` in ~15 s.
+  `make_request()` helper lives in `test_seeds.py`.
 
 ## Decisions made
 
@@ -129,16 +145,70 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 - One filename timestamp per job (all images in a job share it).
 - pillow floor raised to `>=10.1` (`ImageFont.load_default(size=)`).
 
-## Open questions / TODO
+### Phase 3 decisions
 
-- Weighted-prompt library choice (spec mentions `sd_embed`) — decide in Phase 3; keep behind
-  `src/prompting.py`. A pure-Python `(text:weight)` parser could avoid the extra dependency.
+- **Prompt weighting is implemented in-house** (not `sd_embed`, which isn't on PyPI and
+  would mean a git dependency on Colab). Method: A1111 "original" emphasis, applied per
+  77-token chunk: z *= weight per token, then rescale so the chunk mean is unchanged.
+  Unweighted prompts skip this, so they exactly match diffusers' `encode_prompt`; tests
+  assert that for SD1.5 and SDXL. SD1.5 uses `last_hidden_state` (clip_skip None); SDXL uses
+  `hidden_states[-2]` of both encoders concatenated, and pooled = `text_encoder_2` output[0]
+  of the first chunk.
+- **Weight syntax**: regex `\(([^()]*):\s*number\s*\)`; other parentheses are literal;
+  `\(`/`\)` are escapes. `(ratio:16:9)` parses as "ratio:16" weight 9 (same as A1111). No
+  nesting, no bare `(x)` = 1.1, no `[x]`.
+- **Long prompts**: 75-token chunks `[BOS] + ≤75 + [EOS] + PAD`; every prompt in a batch
+  (positive and negative) is padded to the same chunk count with empty chunks. Each distinct
+  string is encoded once per batch (10 identical prompts → 1 positive + 1 negative encode).
+- **SDXL empty negative** → zero embeddings and zero pooled when
+  `pipe.config.force_zeros_for_empty_prompt` (mirrors diffusers).
+- **Schedulers**: a fresh scheduler per job via `from_config(checkpoint scheduler config,
+  **overrides)`. Overrides set `use_karras_sigmas` explicitly (False for euler/heun), so a
+  checkpoint config can't change the meaning of a sampler.
+- **Loading**: `from_single_file` with fp16; sd15 `safety_checker=None,
+  requires_safety_checker=False`; sdxl `add_watermarker=False`. img2img = `from_pipe(txt2img)`
+  (shared modules, verified by identity in tests); SDXL img2img gets `watermark = None`.
+  Model family is explicit; no auto-detect.
+- **Optimization profiles**: `baseline` (default until Phase 8), `compile`
+  (channels_last UNet + `torch.compile(reduce-overhead, fullgraph)`), `compile-max`
+  (+ VAE channels_last and compiled `vae.decode`, max-autotune). Any failure at setup *or*
+  in warm-up reverts to the original modules and logs "falling back to baseline". When
+  compiled, the first use of a new (mode, w, h) logs "Optimizing new tensor shape…".
+- **Generators**: one `torch.Generator(device)` per image. Tests verify an image is the same
+  whether generated alone or inside a batch, so OOM splitting doesn't change results.
+- **Progress** uses `callback_on_step_end` with `pipeline.num_timesteps` as the total. For
+  Heun/DPM2 that's about 2× steps (second-order samplers run more iterations).
+- **OOM detection**: `torch.OutOfMemoryError`; on OOM: `gc.collect()` + `cuda.empty_cache()` + log.
+- **Allocator**: `configure_cuda_allocator()` sets `PYTORCH_ALLOC_CONF` (setdefault). It only
+  works before torch is imported, so the CLI must call it first thing (Phase 4).
+- **Warm-up**: txt2img, batch 1, `WARMUP_STEPS = 3` steps, at the family default size
+  (overridable by `warmup_size`), output discarded.
+- CPU tests lower `MIN_DIMENSION` to 64 via monkeypatch (tiny models at 256 px took 5 min).
+
+### Needs Colab (Phase 8) — cannot be verified locally
+
+- `from_single_file` on real SD1.5/SDXL checkpoints (and Hub config fetch) in fp16 on CUDA.
+- SDXL fp16 VAE decode (NaN/black images): diffusers upcasts via the VAE `force_upcast`
+  config; confirm.
+- Real `torch.compile` behaviour/speed per profile; CUDA-graph warm-up step count.
+- Real OOM thresholds at 1024² for batch 10; `expandable_segments` effect.
+- Visual check that weighting/samplers look right on a real model.
+
+## Open questions / TODO
 - SPEC/COLAB_COMPATIBILITY still reference Python 3.12 — consider updating docs.
 
 ## Learnings
 
 - Ruff ≥ 0.16 formats code blocks inside Markdown — exclude docs from ruff.
 - Pillow EXIF test: save a JPEG with `exif[0x0112] = 6`; `ImageOps.exif_transpose` rotates it.
+- transformers 5's `CLIPTokenizer` is tokenizers-backed: build it offline with
+  `CLIPTokenizer(vocab=dict, merges=[])`; `bytes_to_unicode` is in
+  `transformers.convert_slow_tokenizer`. A char-level vocab (256 bytes + `</w>` variants +
+  specials) is enough for tests. Put EOS as the highest id; config `eos_token_id` must match.
+- Diffusers' tiny-pipeline configs (32/64 channels, 5-layer CLIP of width 32) build in <1 s,
+  with no network.
+- Mutation checks run: a single shared generator → the batch-invariance test fails;
+  skipping `_apply_weights` → the weighting tests fail.
 - Bug caught by tests: the remainder batch (e.g. the final 1 of 7 at size 3) originally
   overwrote the learned OOM limit with 1. Fixed: only full-size successes update the limit.
 - A deliberate "stretch instead of crop" bug makes `test_preprocess.py` fail, so the

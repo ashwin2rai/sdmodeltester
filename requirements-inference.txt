@@ -8,4 +8,4 @@ transformers
 accelerate
 safetensors
 huggingface_hub
-# weighted-prompt adapter dependency: selected during Phase 3 (isolated behind src/prompting.py)
+# (prompt weighting is implemented in src/prompting.py; no extra dependency)

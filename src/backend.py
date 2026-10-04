@@ -6,14 +6,16 @@ backend (Phase 3) imports them lazily inside its methods.
 
 from __future__ import annotations
 
+import gc
 import math
+import os
 import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar, get_args
+from typing import Any, Literal, Protocol, TypeVar, get_args
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -39,6 +41,24 @@ SAMPLERS: tuple[tuple[str, str], ...] = (
 )
 SAMPLER_IDS: tuple[str, ...] = tuple(sid for sid, _ in SAMPLERS)
 SAMPLER_LABELS: dict[str, str] = dict(SAMPLERS)
+
+# Sampler ID -> (diffusers scheduler class name, from_config overrides). SPEC §8.
+# Overrides are explicit (incl. use_karras_sigmas=False) so settings in the checkpoint's
+# own scheduler config can't silently turn e.g. "Euler" into "Euler Karras".
+SAMPLER_SCHEDULERS: dict[str, tuple[str, dict[str, Any]]] = {
+    "dpmpp_2m_karras": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "dpmsolver++", "solver_order": 2, "use_karras_sigmas": True},
+    ),
+    "dpmpp_2m_sde_karras": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "sde-dpmsolver++", "solver_order": 2, "use_karras_sigmas": True},
+    ),
+    "euler": ("EulerDiscreteScheduler", {"use_karras_sigmas": False}),
+    "euler_a": ("EulerAncestralDiscreteScheduler", {}),
+    "heun": ("HeunDiscreteScheduler", {"use_karras_sigmas": False}),
+    "dpm2_karras": ("KDPM2DiscreteScheduler", {"use_karras_sigmas": True}),
+}
 
 MAX_IMAGES = 10
 MIN_DIMENSION = 256
@@ -603,3 +623,284 @@ def save_png(image: Image.Image, path: Path) -> None:
     clean = Image.new(image.mode, image.size)
     clean.paste(image)
     clean.save(path, format="PNG")
+
+
+# ---------------------------------------------------------------------------
+# Real Diffusers backend (SPEC §6, §13, §14). torch/diffusers imported lazily.
+# ---------------------------------------------------------------------------
+
+# Optimization profiles compared in Phase 8 (SPEC §13.4). "baseline" = FP16 + SDPA.
+OPTIMIZATION_PROFILES: tuple[str, ...] = ("baseline", "compile", "compile-max")
+DEFAULT_OPTIMIZATION = "baseline"  # until Phase 8 L4 benchmarks pick a winner
+WARMUP_STEPS = 3
+
+
+def configure_cuda_allocator() -> None:
+    """Set the allocator config; only effective if called before torch is imported."""
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+
+def make_scheduler(sampler: str, base_config: Any) -> Any:
+    """Build a fresh scheduler for ``sampler`` from the checkpoint's scheduler config."""
+    import diffusers
+
+    class_name, overrides = SAMPLER_SCHEDULERS[sampler]
+    return getattr(diffusers, class_name).from_config(base_config, **overrides)
+
+
+class DiffusersBackend:
+    """Single-file SD1.5/SDXL checkpoint kept resident on the GPU.
+
+    ``pipeline_loader`` replaces ``from_single_file`` (tests inject tiny random
+    pipelines); ``device``/``dtype`` default to the Colab L4 fast path.
+    """
+
+    def __init__(
+        self,
+        family: ModelFamily,
+        model_path: Path | str,
+        *,
+        device: str = "cuda",
+        dtype: str = "float16",
+        optimization: str = DEFAULT_OPTIMIZATION,
+        warmup_steps: int = WARMUP_STEPS,
+        warmup_size: tuple[int, int] | None = None,
+        log: Callable[[str], None] | None = None,
+        pipeline_loader: Callable[[], Any] | None = None,
+    ) -> None:
+        if optimization not in OPTIMIZATION_PROFILES:
+            raise ValueError(f"optimization must be one of {', '.join(OPTIMIZATION_PROFILES)}")
+        self.family = check_family(family)
+        self.model_path = Path(model_path)
+        self.model_name = self.model_path.name
+        self.device = device
+        self.dtype_name = dtype
+        self.optimization = optimization
+        self.active_optimization = "baseline"
+        self.warmup_steps = warmup_steps
+        defaults = FAMILY_DEFAULTS[self.family]
+        self.warmup_size = warmup_size or (defaults.width, defaults.height)
+        self.log = log or (lambda message: None)
+        self.pipeline_loader = pipeline_loader
+        self.batcher = MicroBatcher()
+        self.txt2img: Any = None
+        self.img2img: Any = None
+        self.base_scheduler_config: Any = None
+        self._original_modules: dict[str, Any] = {}
+        self._seen_shapes: set[BatchKey] = set()
+
+    # -- loading -------------------------------------------------------------
+
+    def load(self, status_callback: StatusCallback | None = None) -> None:
+        status = status_callback or (lambda state, message: None)
+        configure_cuda_allocator()
+        status("loading", "Loading checkpoint…")
+        started = time.monotonic()
+        pipe = self.pipeline_loader() if self.pipeline_loader else self._load_single_file()
+        pipe.set_progress_bar_config(disable=True)
+        self.txt2img = pipe
+        self.img2img = self._img2img_from(pipe)
+        self.base_scheduler_config = pipe.scheduler.config
+        self.log(f"Loaded {self.model_name} ({self.family}) in {time.monotonic() - started:.1f}s")
+        if self.optimization != "baseline":
+            status("optimizing", "Applying optimizations…")
+            self._apply_optimization(self.optimization)
+
+    def _load_single_file(self) -> Any:
+        import diffusers
+        import torch
+
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"checkpoint not found: {self.model_path}")
+        dtype = getattr(torch, self.dtype_name)
+        if self.family == "sd15":
+            pipe = diffusers.StableDiffusionPipeline.from_single_file(
+                str(self.model_path),
+                torch_dtype=dtype,
+                safety_checker=None,
+                requires_safety_checker=False,
+            )
+        else:
+            pipe = diffusers.StableDiffusionXLPipeline.from_single_file(
+                str(self.model_path), torch_dtype=dtype, add_watermarker=False
+            )
+        return pipe.to(self.device)
+
+    def _img2img_from(self, pipe: Any) -> Any:
+        """Img2img pipeline sharing the already-loaded components (no second weight copy)."""
+        import diffusers
+
+        if self.family == "sd15":
+            return diffusers.StableDiffusionImg2ImgPipeline.from_pipe(
+                pipe, safety_checker=None, requires_safety_checker=False
+            )
+        img2img = diffusers.StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
+        img2img.watermark = None  # SPEC §6.4: never watermark
+        return img2img
+
+    # -- optional acceleration -----------------------------------------------
+
+    def _set_module(self, name: str, module: Any) -> None:
+        for pipe in (self.txt2img, self.img2img):
+            setattr(pipe, name, module)
+
+    def _apply_optimization(self, profile: str) -> None:
+        """channels_last + torch.compile; any failure falls back to the baseline."""
+        import torch
+
+        self._original_modules = {"unet": self.txt2img.unet, "vae": self.txt2img.vae}
+        try:
+            mode = "max-autotune" if profile == "compile-max" else "reduce-overhead"
+            unet = self.txt2img.unet.to(memory_format=torch.channels_last)
+            self._set_module("unet", torch.compile(unet, mode=mode, fullgraph=True))
+            if profile == "compile-max":
+                vae = self.txt2img.vae.to(memory_format=torch.channels_last)
+                vae.decode = torch.compile(vae.decode, mode=mode, fullgraph=True)
+            self.active_optimization = profile
+            self.log(f"Optimization: {profile} (torch.compile {mode}); compiles on first use")
+        except Exception as exc:  # noqa: BLE001 — any optional-acceleration failure
+            self._revert_optimization(f"{type(exc).__name__}: {exc}")
+
+    def _revert_optimization(self, reason: str) -> None:
+        for name, module in self._original_modules.items():
+            if name == "vae" and "decode" in vars(module):
+                del module.decode  # drop the compiled instance attribute
+            self._set_module(name, module)
+        self.active_optimization = "baseline"
+        self.log(f"Optimization failed, falling back to baseline: {reason}")
+
+    # -- warm-up -------------------------------------------------------------
+
+    def warmup(self, status_callback: StatusCallback | None = None) -> None:
+        """One batch-1 generation at the family default size; no output file."""
+        status = status_callback or (lambda state, message: None)
+        status("warming", "Warm-up 1/1…")
+        started = time.monotonic()
+        try:
+            self._warmup_once()
+        except Exception as exc:  # noqa: BLE001
+            if self.active_optimization == "baseline":
+                raise
+            self._revert_optimization(f"warm-up failed: {type(exc).__name__}: {exc}")
+            self._warmup_once()
+        self.log(f"Warm-up complete in {time.monotonic() - started:.1f}s")
+
+    def _warmup_once(self) -> None:
+        d = FAMILY_DEFAULTS[self.family]
+        width, height = self.warmup_size
+        req = GenerationRequest(
+            "warm-up", "", width, height, self.warmup_steps, d.guidance_scale,
+            d.sampler, 0, 1,
+        )  # fmt: skip
+        spec = ResolvedImageSpec(0, 0, req.prompt, req.negative_prompt)
+        self._run_pipeline(req, [spec], None, lambda step, total: None)
+        self._seen_shapes.add((req.mode, req.width, req.height))
+
+    # -- generation ----------------------------------------------------------
+
+    def generate(
+        self,
+        job: ResolvedGenerationJob,
+        output_dir: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> GenerationResult:
+        if self.txt2img is None:
+            raise GenerationError("Backend is not loaded")
+        import torch
+
+        req = job.request
+        started = time.monotonic()
+        now = datetime.now()
+        key: BatchKey = (req.mode, req.width, req.height)
+        if self.active_optimization != "baseline" and key not in self._seen_shapes:
+            self.log(
+                f"Optimizing new tensor shape {req.width}x{req.height}; "
+                "first generation at this size may be slower."
+            )
+        self._seen_shapes.add(key)
+        source = (
+            preprocess_image(req.input_image, req.width, req.height)
+            if req.input_image is not None
+            else None
+        )
+        written: list[Path] = []
+
+        def run_batch(
+            batch: Sequence[ResolvedImageSpec], on_step: Callable[[int, int], None]
+        ) -> list[Path]:
+            images = self._run_pipeline(req, batch, source, on_step)
+            paths = []
+            for spec, image in zip(batch, images, strict=True):
+                path = collision_safe_path(
+                    output_dir, output_filename(job.job_id, spec.index, spec.seed, now)
+                )
+                save_png(image, path)
+                written.append(path)
+                paths.append(path)
+            return paths
+
+        def on_oom(failed: int, next_size: int) -> None:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.log(f"CUDA out of memory at batch {failed}; retrying with batch {next_size}")
+
+        try:
+            paths = self.batcher.run(
+                key,
+                job.images,
+                run_batch,
+                is_oom=lambda exc: isinstance(exc, torch.OutOfMemoryError),
+                progress_callback=progress_callback,
+                on_oom=on_oom,
+            )
+        except Exception as exc:
+            raise GenerationError(f"{type(exc).__name__}: {exc}", written) from exc
+
+        return GenerationResult(
+            output_paths=tuple(paths),
+            seeds=job.seeds,
+            resolved_prompts=tuple(spec.prompt for spec in job.images),
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    def _run_pipeline(
+        self,
+        req: GenerationRequest,
+        batch: Sequence[ResolvedImageSpec],
+        source: Image.Image | None,
+        on_step: Callable[[int, int], None],
+    ) -> list[Image.Image]:
+        import torch
+
+        from src.prompting import encode_prompt_batch
+
+        pipe = self.txt2img if source is None else self.img2img
+        pipe.scheduler = make_scheduler(req.sampler, self.base_scheduler_config)
+        embeds = encode_prompt_batch(
+            pipe,
+            self.family,
+            [spec.prompt for spec in batch],
+            [spec.negative_prompt for spec in batch],
+        )
+        # One generator per image: an image depends only on its own seed (SPEC §10).
+        generators = [torch.Generator(device=self.device).manual_seed(s.seed) for s in batch]
+
+        def callback(pipeline: Any, step_index: int, timestep: Any, kwargs: dict) -> dict:
+            on_step(step_index + 1, pipeline.num_timesteps)
+            return kwargs
+
+        call_kwargs: dict[str, Any] = dict(
+            embeds,
+            num_inference_steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            generator=generators,
+            callback_on_step_end=callback,
+            output_type="pil",
+        )
+        if source is None:
+            call_kwargs.update(width=req.width, height=req.height)
+        else:
+            call_kwargs.update(image=[source] * len(batch), strength=req.strength)
+        with torch.inference_mode():
+            return pipe(**call_kwargs).images
