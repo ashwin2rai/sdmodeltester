@@ -182,8 +182,8 @@ everywhere without torch.
 **(owner)** A minimal, shareable orchestrator — it clones this public repo and never contains a
 second implementation of anything. Four form cells, plain Python, no magics:
 1. **Settings** — `MODEL_FAMILY`, `MODEL_URL`, optional `HF_TOKEN` / `CIVITAI_TOKEN`, `PORT`.
-2. **Install** — clone to `/content/sdmodeltester`, install both requirement files on top of
-   Colab's torch, run `doctor` (stop on failure).
+2. **Install** — clone to `/content/sdmodeltester` (or `git pull` when rerun), install both
+   requirement files on top of Colab's torch, run `doctor` (stop on failure).
 3. **Download** — Hugging Face file links via `hf_hub_download`; Civitai version links
    (`?modelVersionId=` or `/api/download/models/<id>`) with the token as `?token=`; stream to a
    `.part` file; the result must be a full-size `.safetensors` file with a valid header.

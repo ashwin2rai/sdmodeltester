@@ -95,6 +95,7 @@ def test_cells_end_to_end(tmp_path, capsys):
         ns.update(MODEL_URL=f"http://127.0.0.1:{files.server_address[1]}/model.safetensors",
                   PORT=port)  # fmt: skip
         run(1)
+        run(1)  # rerunning the install cell pulls instead of cloning
         ns["cu"].MIN_CHECKPOINT_BYTES = 100  # the fake checkpoint is tiny
         run(2)
         assert ns["MODEL_PATH"] == repo_dir / "models" / "model.safetensors"
@@ -114,6 +115,7 @@ def test_cells_end_to_end(tmp_path, capsys):
     # (Download progress is a single line overwritten with "\r", as Colab displays it.)
     assert [o.split("\r")[-1].strip() for o in outputs] == [
         "",
+        "✓ Installed",
         "✓ Installed",
         "✓ model.safetensors",
         f"Open http://127.0.0.1:{port}/",

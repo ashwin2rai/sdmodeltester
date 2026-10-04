@@ -56,6 +56,22 @@ where we are, and what we learned.
 - To refresh this check later: download `pip-freeze.gpu.txt`, build a venv with those pins
   (CPU torch from the pytorch-cpu index), dry-run the requirements, run pytest.
 
+## First real Colab L4 run (2026-10-04, owner)
+
+- SD1.5 community checkpoint (`realismByStableYogi_sd15V9.safetensors`): `from_single_file`
+  FP16 on CUDA loaded in 11.5 s, warm-up 1.3 s, backend ready at 12.8 s. Diffusers logs a
+  harmless "modules … should be kept in float32: []" notice (empty list).
+- **The iframe did not appear**: `serve_kernel_port_as_iframe` returns without drawing when
+  `google.colab.kernel.accessAllowed` is false. Workarounds tried and **rejected**:
+  - full-tab `proxyPort` URL (`https://8000-…prod.colab.dev`): Colab's proxy answers 404 on every
+    path (incl. `/api/status`) — our server never sees the request;
+  - `serve_kernel_port_as_iframe(..., cache_in_notebook=True)`: the UI loads and GETs work, but
+    every POST/DELETE fails with Colab's "500 Not allowed" (read-only cached proxy).
+  - Open hypothesis (being tested by the owner): `accessAllowed` is false because the notebook
+    was opened directly from GitHub (untrusted); "File → Save a copy in Drive" may fix it.
+- Cell 2 now `git pull`s when rerun, so pushing a fix + rerunning cells 2 and 4 updates a live
+  session.
+
 ## Still unverified (needs Colab)
 
 - `from_single_file` FP16 on CUDA for both families (Hub config fetch); SDXL FP16 VAE black
