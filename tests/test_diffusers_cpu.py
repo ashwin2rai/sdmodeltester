@@ -496,7 +496,7 @@ def test_benchmark_and_functional_checks_real_backend(family, tmp_path):
     result = benchmark.benchmark_profile(make_backend(family), family, tmp_path / "perf", **small)
     assert result["profile_active"] == "baseline"
     assert result["timings_s"]["batch_10"] > 0
-    assert result["memory"]["batch_10"] is None  # CPU: no CUDA stats
+    assert result["peak_vram_batches"] is None  # CPU: no CUDA stats
 
     backend = make_backend(family)
     backend.load()

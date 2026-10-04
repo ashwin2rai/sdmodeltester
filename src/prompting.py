@@ -86,10 +86,6 @@ def validate_template(text: str) -> None:
     parse_template(text)
 
 
-def has_dynamic_groups(text: str) -> bool:
-    return any(isinstance(seg, tuple) for seg in parse_template(text))
-
-
 def prompt_rng(seed: int) -> random.Random:
     """Deterministic PRNG for dynamic choices of the image with this concrete seed."""
     return random.Random(seed ^ PROMPT_RNG_SALT)

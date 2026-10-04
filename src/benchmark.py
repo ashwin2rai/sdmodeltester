@@ -1,16 +1,14 @@
 """Phase 8 tooling: optimization-profile benchmark and functional verification.
 
-Runs on the Colab L4 (``python -m src.cli benchmark ...``) and writes a Markdown report
-shaped like ``compat/known-good-colab.md`` plus a JSON dump and a contact sheet of every
-functional-check image for visual review (SPEC §13.4, §23; COLAB_COMPATIBILITY §3).
-
-Everything here drives the public backend contract (load / warmup / generate), so it is
-exercised locally with the mock backend and the tiny CPU Diffusers pipelines.
+``python -m src.cli benchmark`` runs this on the Colab L4 and writes a Markdown report
+(fields of ``compat/known-good-colab.md``) plus a contact sheet of every functional-check
+image for visual review (SPEC §13.4, §23; COLAB_COMPATIBILITY §3). It only uses the public
+backend contract, so the mock and tiny CPU pipelines exercise it locally.
 """
 
 from __future__ import annotations
 
-import platform
+import itertools
 import statistics
 import time
 from collections.abc import Callable
@@ -31,46 +29,33 @@ from src.backend import (
     resolve_job,
 )
 
-# Non-default shapes for the "first generation at a new resolution" measurement.
-ALT_SIZES = {"sd15": (768, 512), "sdxl": (896, 1152)}
-# Accept profile B/C over baseline only if warm latency improves by at least this much.
-MIN_SPEEDUP = 0.05
-BLACK_THRESHOLD = 8  # max channel value at or below this => "black image" failure
+ALT_SIZES = {"sd15": (768, 512), "sdxl": (896, 1152)}  # "first run at a new resolution"
+MIN_SPEEDUP = 0.05  # a compiled profile must beat baseline by this much to be recommended
+BLACK_THRESHOLD = 8  # max channel value at or below this => "black image" (fp16 VAE NaNs)
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
+class Runner:
+    """Builds requests from family defaults and times ``backend.generate``."""
 
-
-@dataclass
-class RunContext:
-    backend: Backend
-    family: str
-    output_dir: Path
-    steps: int | None = None  # override the family default (tests use tiny values)
-    size: tuple[int, int] | None = None  # override the family default size
-    _job_ids: Any = field(default_factory=lambda: iter(range(1, 10**9)))
-
-    def request(self, **overrides: Any) -> GenerationRequest:
-        d = FAMILY_DEFAULTS[self.family]
-        width, height = self.size or (d.width, d.height)
-        fields = dict(
+    def __init__(self, backend: Backend, family: str, output_dir: Path, steps=None, size=None):
+        d = FAMILY_DEFAULTS[family]
+        self.backend, self.output_dir = backend, output_dir
+        self.defaults = dict(
             prompt="a photo of a red fox in a snowy forest, detailed",
             negative_prompt="blurry, lowres",
-            width=width,
-            height=height,
-            steps=self.steps or d.steps,
+            width=(size or (d.width, d.height))[0],
+            height=(size or (d.width, d.height))[1],
+            steps=steps or d.steps,
             guidance_scale=d.guidance_scale,
             sampler=d.sampler,
             seed=1,
             num_images=1,
         )
-        fields.update(overrides)
-        return GenerationRequest(**fields)
+        self.job_ids = itertools.count(1)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, req: GenerationRequest) -> tuple[GenerationResult, float]:
-        job = resolve_job(req, job_id=next(self._job_ids))
+    def run(self, **overrides: Any) -> tuple[GenerationResult, float]:
+        job = resolve_job(GenerationRequest(**{**self.defaults, **overrides}), next(self.job_ids))
         started = time.perf_counter()
         result = self.backend.generate(job, self.output_dir)
         return result, time.perf_counter() - started
@@ -79,12 +64,6 @@ class RunContext:
 def _memory(backend: Backend) -> dict[str, float] | None:
     stats = getattr(backend, "memory_stats", None)
     return stats() if stats else None
-
-
-def _reset_memory(backend: Backend) -> None:
-    reset = getattr(backend, "reset_peak_memory", None)
-    if reset:
-        reset()
 
 
 def is_black(path: Path) -> bool:
@@ -116,94 +95,64 @@ def benchmark_profile(
     log: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Measure one optimization profile on an *unloaded* backend."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ctx = RunContext(backend, family, output_dir, steps=steps, size=size)
-    timings: dict[str, Any] = {}
-    memory: dict[str, Any] = {}
+    runner = Runner(backend, family, output_dir, steps, size)
+    timings: dict[str, float] = {}
 
-    def step(name: str, fn: Callable[[], Any]) -> Any:
-        log(f"benchmark: {name}…")
+    def timed(name: str, fn: Callable[[], Any]) -> Any:
         started = time.perf_counter()
         value = fn()
         timings[name] = round(time.perf_counter() - started, 3)
-        log(f"benchmark: {name} {timings[name]:.2f}s")
+        log(f"benchmark {profile}: {name} {timings[name]:.2f}s")
         return value
 
-    _reset_memory(backend)
-    step("load", backend.load)
-    memory["after_load"] = _memory(backend)
-    step("warmup", backend.warmup)
-    active = getattr(backend, "active_optimization", profile)
-
-    first_path = None
-    for i in (1, 2, 3):
-        result = step(f"warm_single_{i}", lambda i=i: ctx.run(ctx.request(seed=i))[0])
-        first_path = first_path or result.output_paths[0]
-    memory["single"] = _memory(backend)
-
+    timed("load", backend.load)
+    timed("warmup", backend.warmup)
+    first = timed("warm_single_1", lambda: runner.run(seed=1)[0]).output_paths[0]
+    timed("warm_single_2", lambda: runner.run(seed=2))
+    timed("warm_single_3", lambda: runner.run(seed=3))
+    if reset := getattr(backend, "reset_peak_memory", None):
+        reset()
     for n in (5, 10):
-        _reset_memory(backend)
-        step(f"batch_{n}", lambda n=n: ctx.run(ctx.request(seed=100, num_images=n)))
-        timings[f"batch_{n}_images_per_s"] = round(n / timings[f"batch_{n}"], 3)
-        memory[f"batch_{n}"] = _memory(backend)
-
+        timed(f"batch_{n}", lambda n=n: runner.run(seed=100, num_images=n))
+    peak = _memory(backend)
     alt_w, alt_h = alt_size or ALT_SIZES[family]
-    step("new_size_first", lambda: ctx.run(ctx.request(width=alt_w, height=alt_h)))
-    step("new_size_second", lambda: ctx.run(ctx.request(width=alt_w, height=alt_h, seed=2)))
-    d = FAMILY_DEFAULTS[family]
-    step(
-        "img2img_first",
-        lambda: ctx.run(ctx.request(input_image=first_path, strength=d.strength)),
-    )
-    step(
-        "img2img_second",
-        lambda: ctx.run(ctx.request(input_image=first_path, strength=d.strength, seed=2)),
-    )
+    for which in ("first", "second"):
+        timed(f"new_size_{which}", lambda: runner.run(width=alt_w, height=alt_h))
+    strength = FAMILY_DEFAULTS[family].strength
+    for which in ("first", "second"):
+        timed(f"img2img_{which}", lambda: runner.run(input_image=first, strength=strength))
 
-    warm = [timings["warm_single_2"], timings["warm_single_3"]]
     return {
-        "profile_requested": profile,
-        "profile_active": active,
+        "profile_active": getattr(backend, "active_optimization", profile),
         "timings_s": timings,
-        "warm_single_median_s": round(statistics.median(warm), 3),
-        "startup_s": round(timings["load"] + timings["warmup"], 3),
-        "memory": memory,
-        "batch_limits": {
-            f"{mode} {w}x{h}": size for (mode, w, h), size in backend.batcher.limits.items()
-        },
-        "steps": ctx.steps or d.steps,
-        "size": list(ctx.size or (d.width, d.height)),
-        "alt_size": [alt_w, alt_h],
+        "warm_single_median_s": statistics.median(
+            [timings["warm_single_2"], timings["warm_single_3"]]
+        ),
+        "startup_s": timings["load"] + timings["warmup"],
+        "peak_vram_batches": peak,
+        "batch_limits": {f"{m} {w}x{h}": n for (m, w, h), n in backend.batcher.limits.items()},
+        "settings": f"{runner.defaults['steps']} steps, "
+        f"{runner.defaults['width']}x{runner.defaults['height']} (new size {alt_w}x{alt_h})",
     }
 
 
 def recommend(results: dict[str, dict[str, Any]]) -> tuple[str | None, str]:
-    """Pick the default profile: fastest warm single-image latency that is stable.
-
-    A compiled profile must beat baseline by ``MIN_SPEEDUP`` to be worth its startup
-    cost; profiles that errored or fell back to baseline are not candidates.
-    """
-    ok = {
-        name: r
-        for name, r in results.items()
-        if "error" not in r and r.get("profile_active") == name
-    }
+    """Fastest warm single-image latency among profiles that ran and stayed active; a
+    compiled profile must beat baseline by ``MIN_SPEEDUP`` to be worth its startup cost."""
+    ok = {n: r for n, r in results.items() if "error" not in r and r["profile_active"] == n}
     if not ok:
         return None, "no profile completed"
-    best = min(ok, key=lambda name: ok[name]["warm_single_median_s"])
-    baseline = ok.get("baseline")
-    if baseline and best != "baseline":
-        gain = 1 - ok[best]["warm_single_median_s"] / baseline["warm_single_median_s"]
-        if gain < MIN_SPEEDUP:
-            return "baseline", (
-                f"{best} is only {gain:.0%} faster than baseline (< {MIN_SPEEDUP:.0%}); "
-                "keeping baseline"
-            )
-        return best, (
-            f"{best} is {gain:.0%} faster per warm image than baseline; startup "
-            f"{ok[best]['startup_s']:.0f}s vs {baseline['startup_s']:.0f}s"
-        )
-    return best, f"{best} has the lowest warm single-image latency"
+    best = min(ok, key=lambda n: ok[n]["warm_single_median_s"])
+    base = ok.get("baseline")
+    if not base or best == "baseline":
+        return best, f"{best} has the lowest warm single-image latency"
+    gain = 1 - ok[best]["warm_single_median_s"] / base["warm_single_median_s"]
+    if gain < MIN_SPEEDUP:
+        return "baseline", f"{best} is only {gain:.0%} faster than baseline; keeping baseline"
+    return best, (
+        f"{best} is {gain:.0%} faster per warm image than baseline; "
+        f"startup {ok[best]['startup_s']:.0f}s vs {base['startup_s']:.0f}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,147 +178,123 @@ def functional_checks(
     alt_size: tuple[int, int] | None = None,
     log: Callable[[str], None] = print,
 ) -> list[Check]:
-    """Run the functional matrix on a *loaded* backend; never raises per check."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ctx = RunContext(backend, family, output_dir, steps=steps, size=size)
+    """Run the functional matrix on a *loaded* backend; failures are recorded, not raised."""
+    r = Runner(backend, family, output_dir, steps, size)
     d = FAMILY_DEFAULTS[family]
-    width, height = ctx.size or (d.width, d.height)
-    checks: list[Check] = []
-    state: dict[str, Path] = {}
+    alt_w, alt_h = alt_size or ALT_SIZES[family]
+    first: list[Path] = []
 
-    def check(name: str, fn: Callable[[], tuple[bool, str, list[Path]]]) -> None:
-        log(f"verify: {name}…")
-        try:
-            ok, detail, images = fn()
-        except Exception as exc:  # noqa: BLE001 — record and continue
-            ok, detail, images = False, f"{type(exc).__name__}: {exc}", []
-        black = [p.name for p in images if is_black(p)]
-        if black:
-            ok, detail = False, f"black image(s): {', '.join(black)}; {detail}"
-        checks.append(Check(name, ok, detail, images))
-        log(f"verify: {name}: {'ok' if ok else 'FAIL'} {detail}")
-
-    def sizes_ok(result: GenerationResult, w: int, h: int) -> bool:
+    def sized(result: GenerationResult, w: int, h: int) -> bool:
         for path in result.output_paths:
             with Image.open(path) as img:
                 if img.size != (w, h):
                     return False
         return True
 
-    def txt2img(n: int) -> tuple[bool, str, list[Path]]:
-        result, secs = ctx.run(ctx.request(seed=500, num_images=n))
-        state.setdefault("source", result.output_paths[0])
-        expected = tuple(range(500, 500 + n))
-        ok = len(result.output_paths) == n and result.seeds == expected
-        ok = ok and sizes_ok(result, width, height)
-        return ok, f"{n} image(s) in {secs:.1f}s", list(result.output_paths)
+    def txt2img(n: int):
+        result, secs = r.run(seed=500, num_images=n)
+        first.append(result.output_paths[0])
+        ok = result.seeds == tuple(range(500, 500 + n))
+        ok = ok and sized(result, r.defaults["width"], r.defaults["height"])
+        return ok, f"{n} image(s) in {secs:.1f}s", result.output_paths
 
-    def img2img(n: int) -> tuple[bool, str, list[Path]]:
-        result, secs = ctx.run(
-            ctx.request(input_image=state["source"], strength=d.strength, seed=600, num_images=n)
-        )
-        ok = len(result.output_paths) == n and sizes_ok(result, width, height)
-        return ok, f"{n} image(s) in {secs:.1f}s", list(result.output_paths)
+    def img2img(n: int):
+        result, secs = r.run(input_image=first[0], strength=d.strength, seed=600, num_images=n)
+        ok = len(result.output_paths) == n
+        return ok and sized(result, r.defaults["width"], r.defaults["height"]), \
+            f"{n} image(s) in {secs:.1f}s", result.output_paths  # fmt: skip
 
-    check("txt2img x1", lambda: txt2img(1))
-    check("txt2img x10", lambda: txt2img(10))
-    check("img2img x1", lambda: img2img(1))
-    check("img2img x10", lambda: img2img(10))
+    def sampler(sid: str):
+        result, secs = r.run(sampler=sid, seed=700)
+        return len(result.output_paths) == 1, f"{secs:.1f}s", result.output_paths
 
-    for sampler in SAMPLER_IDS:
+    def random_seeds():
+        result, _ = r.run(seed=-1, num_images=3)
+        return -1 not in result.seeds and len(set(result.seeds)) == 3, \
+            f"seeds {list(result.seeds)}", result.output_paths  # fmt: skip
 
-        def run_sampler(sampler: str = sampler) -> tuple[bool, str, list[Path]]:
-            result, secs = ctx.run(ctx.request(sampler=sampler, seed=700))
-            return len(result.output_paths) == 1, f"{secs:.1f}s", list(result.output_paths)
-
-        check(f"sampler {SAMPLER_LABELS[sampler]}", run_sampler)
-
-    def random_seeds() -> tuple[bool, str, list[Path]]:
-        result, _ = ctx.run(ctx.request(seed=-1, num_images=3))
-        ok = -1 not in result.seeds and len(set(result.seeds)) == 3
-        return ok, f"seeds {list(result.seeds)}", list(result.output_paths)
-
-    def reproducible() -> tuple[bool, str, list[Path]]:
-        a, _ = ctx.run(ctx.request(seed=42))
-        b, _ = ctx.run(ctx.request(seed=42))
+    def reproducible():
+        a, b = r.run(seed=42)[0], r.run(seed=42)[0]
         diff = max_pixel_diff(a.output_paths[0], b.output_paths[0])
-        return diff <= 2, f"same seed twice: max pixel diff {diff}", [a.output_paths[0]]
+        return diff <= 2, f"same seed twice: max pixel diff {diff}", a.output_paths
 
-    def batch_invariance() -> tuple[bool, str, list[Path]]:
-        batch, _ = ctx.run(ctx.request(seed=42, num_images=2))
-        alone, _ = ctx.run(ctx.request(seed=43))
+    def batch_invariance():  # informational tolerance: GPU batched kernels may differ slightly
+        batch, alone = r.run(seed=42, num_images=2)[0], r.run(seed=43)[0]
         diff = max_pixel_diff(batch.output_paths[1], alone.output_paths[0])
-        # informational: GPU batched kernels may differ slightly; large diffs are a bug
-        return diff <= 24, f"seed 43 in batch vs alone: max pixel diff {diff}", []
+        return diff <= 24, f"seed 43 in batch vs alone: max pixel diff {diff}", ()
 
-    def weighted() -> tuple[bool, str, list[Path]]:
-        plain, _ = ctx.run(ctx.request(prompt="a red fox, snow", seed=800))
-        heavy, _ = ctx.run(ctx.request(prompt="a (red:1.6) fox, (snow:0.6)", seed=800))
-        diff = max_pixel_diff(plain.output_paths[0], heavy.output_paths[0])
+    def weighted():
+        plain = r.run(prompt="a red fox, snow", seed=800)[0].output_paths[0]
+        heavy = r.run(prompt="a (red:1.6) fox, (snow:0.6)", seed=800)[0].output_paths[0]
+        diff = max_pixel_diff(plain, heavy)
+        return diff > 0, f"weighted vs plain differ (max diff {diff})", (plain, heavy)
+
+    def dynamic(prompt: str, allowed: set[str], n: int):
+        result, _ = r.run(prompt=prompt, seed=900, num_images=n)
+        return set(result.resolved_prompts) <= allowed, \
+            f"resolved {list(result.resolved_prompts)}", result.output_paths  # fmt: skip
+
+    def non_square():
+        result, secs = r.run(width=alt_w, height=alt_h, seed=950)
+        return sized(result, alt_w, alt_h), f"{alt_w}x{alt_h} in {secs:.1f}s", result.output_paths
+
+    def no_reload():
+        before = backend.load_count
+        times = [r.run(seed=960 + i)[1] for i in range(3)]
         return (
-            diff > 0,
-            f"weighted vs plain differ (max diff {diff})",
-            [
-                plain.output_paths[0],
-                heavy.output_paths[0],
-            ],
+            backend.load_count == before,
+            "latencies " + ", ".join(f"{t:.2f}s" for t in times),
+            (),
         )
 
-    def dynamic() -> tuple[bool, str, list[Path]]:
-        result, _ = ctx.run(
-            ctx.request(prompt="a {red | white | black} fox", seed=900, num_images=4)
-        )
-        allowed = {f"a {c} fox" for c in ("red", "white", "black")}
-        ok = set(result.resolved_prompts) <= allowed
-        return ok, f"resolved {list(result.resolved_prompts)}", list(result.output_paths)
+    colors = ("red", "white", "black")
+    matrix = [
+        ("txt2img x1", lambda: txt2img(1)),
+        ("txt2img x10", lambda: txt2img(10)),
+        ("img2img x1", lambda: img2img(1)),
+        ("img2img x10", lambda: img2img(10)),
+        *[(f"sampler {SAMPLER_LABELS[s]}", lambda s=s: sampler(s)) for s in SAMPLER_IDS],
+        ("seed -1 random per image", random_seeds),
+        ("fixed seed reproducible", reproducible),
+        ("batch invariance", batch_invariance),
+        ("weighted prompt", weighted),
+        ("dynamic prompt", lambda: dynamic("a {red | white | black} fox",
+                                           {f"a {c} fox" for c in colors}, 4)),
+        ("dynamic + weighted", lambda: dynamic("a {(red:1.4) | white} fox",
+                                               {"a (red:1.4) fox", "a white fox"}, 2)),
+        ("non-square", non_square),
+        ("repeated singles, no reload", no_reload),
+    ]  # fmt: skip
 
-    def combined() -> tuple[bool, str, list[Path]]:
-        result, _ = ctx.run(ctx.request(prompt="a {(red:1.4) | white} fox", seed=910, num_images=2))
-        ok = all("{" not in p for p in result.resolved_prompts)
-        return ok, f"resolved {list(result.resolved_prompts)}", list(result.output_paths)
-
-    def non_square() -> tuple[bool, str, list[Path]]:
-        w, h = alt_size or ALT_SIZES[family]
-        result, secs = ctx.run(ctx.request(width=w, height=h, seed=950))
-        return sizes_ok(result, w, h), f"{w}x{h} in {secs:.1f}s", list(result.output_paths)
-
-    def repeated() -> tuple[bool, str, list[Path]]:
-        loads = getattr(backend, "load_count", None)
-        times = [ctx.run(ctx.request(seed=960 + i))[1] for i in range(3)]
-        detail = "latencies " + ", ".join(f"{t:.2f}s" for t in times)
-        after = getattr(backend, "load_count", None)
-        return loads == after, detail, []
-
-    check("seed -1 random per image", random_seeds)
-    check("fixed seed reproducible", reproducible)
-    check("batch invariance", batch_invariance)
-    check("weighted prompt", weighted)
-    check("dynamic prompt", dynamic)
-    check("dynamic + weighted", combined)
-    check("non-square", non_square)
-    check("repeated singles, no reload", repeated)
+    checks = []
+    for name, fn in matrix:
+        try:
+            ok, detail, images = fn()
+        except Exception as exc:  # noqa: BLE001 — record and continue
+            ok, detail, images = False, f"{type(exc).__name__}: {exc}", ()
+        if black := [p.name for p in images if is_black(p)]:
+            ok, detail = False, f"black image(s): {', '.join(black)}; {detail}"
+        checks.append(Check(name, ok, detail, list(images)))
+        log(f"verify: {name}: {'ok' if ok else 'FAIL'} {detail}")
     return checks
 
 
-def contact_sheet(checks: list[Check], path: Path, thumb: int = 160) -> Path | None:
-    """One labelled row per check, up to 10 thumbnails each, for visual review."""
-    rows = [(c, c.images[:10]) for c in checks if c.images]
+def contact_sheet(checks: list[Check] | None, path: Path, thumb: int = 160) -> Path | None:
+    """One labelled row per check (up to 10 thumbnails) for human review of image quality."""
+    rows = [c for c in checks or () if c.images]
     if not rows:
         return None
-    label_w = 220
-    sheet = Image.new("RGB", (label_w + 10 * (thumb + 4), len(rows) * (thumb + 4)), "white")
+    label_w, step = 220, thumb + 4
+    sheet = Image.new("RGB", (label_w + 10 * step, len(rows) * step), "white")
     draw = ImageDraw.Draw(sheet)
     font = ImageFont.load_default(size=14)
-    for r, (c, images) in enumerate(rows):
-        y = r * (thumb + 4)
-        color = "black" if c.ok else "red"
-        draw.multiline_text(
-            (6, y + 6), f"{c.name}\n{'ok' if c.ok else 'FAIL'}", fill=color, font=font
-        )
-        for i, image_path in enumerate(images):
+    for row, c in enumerate(rows):
+        draw.multiline_text((6, row * step + 6), f"{c.name}\n{'ok' if c.ok else 'FAIL'}",
+                            fill="black" if c.ok else "red", font=font)  # fmt: skip
+        for i, image_path in enumerate(c.images[:10]):
             with Image.open(image_path) as img:
                 img.thumbnail((thumb, thumb))
-                sheet.paste(img.convert("RGB"), (label_w + i * (thumb + 4), y))
+                sheet.paste(img.convert("RGB"), (label_w + i * step, row * step))
     path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(path)
     return path
@@ -379,13 +304,23 @@ def contact_sheet(checks: list[Check], path: Path, thumb: int = 160) -> Path | N
 # Report
 # ---------------------------------------------------------------------------
 
-
-def _fmt(value: Any) -> str:
-    if value is None:
-        return "—"
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    return str(value)
+ROWS = [
+    ("active profile", lambda r: r["profile_active"]),
+    ("cold load (s)", lambda r: r["timings_s"]["load"]),
+    ("compile/warm-up (s)", lambda r: r["timings_s"]["warmup"]),
+    *[(f"warm #{i} (s)", lambda r, i=i: r["timings_s"][f"warm_single_{i}"]) for i in (1, 2, 3)],
+    ("batch 5 total (s)", lambda r: r["timings_s"]["batch_5"]),
+    ("batch 10 total (s)", lambda r: r["timings_s"]["batch_10"]),
+    ("batch 10 images/s", lambda r: round(10 / r["timings_s"]["batch_10"], 2)),
+    ("new size first/second (s)",
+     lambda r: f"{r['timings_s']['new_size_first']}/{r['timings_s']['new_size_second']}"),
+    ("img2img first/second (s)",
+     lambda r: f"{r['timings_s']['img2img_first']}/{r['timings_s']['img2img_second']}"),
+    ("peak VRAM in batches (GiB alloc/reserved)",
+     lambda r: "{peak_allocated_gib}/{peak_reserved_gib}".format(**r["peak_vram_batches"])
+     if r["peak_vram_batches"] else "—"),
+    ("OOM batch limits", lambda r: r["batch_limits"] or "none"),
+]  # fmt: skip
 
 
 def render_report(
@@ -397,7 +332,6 @@ def render_report(
     checks: list[Check] | None,
     sheet: Path | None,
 ) -> str:
-    choice, reason = recommend(profiles) if profiles else (None, "not benchmarked")
     lines = [
         f"# Benchmark: {family} · {model_name}",
         "",
@@ -410,62 +344,23 @@ def render_report(
     ]
     if profiles:
         names = list(profiles)
-        rows = [
-            ("active profile", lambda r: r.get("profile_active")),
-            ("cold load (s)", lambda r: r["timings_s"].get("load")),
-            ("compile/warm-up (s)", lambda r: r["timings_s"].get("warmup")),
-            ("warm #1 (s)", lambda r: r["timings_s"].get("warm_single_1")),
-            ("warm #2 (s)", lambda r: r["timings_s"].get("warm_single_2")),
-            ("warm #3 (s)", lambda r: r["timings_s"].get("warm_single_3")),
-            ("batch 5 total (s)", lambda r: r["timings_s"].get("batch_5")),
-            ("batch 10 total (s)", lambda r: r["timings_s"].get("batch_10")),
-            ("batch 10 images/s", lambda r: r["timings_s"].get("batch_10_images_per_s")),
-            ("new size first (s)", lambda r: r["timings_s"].get("new_size_first")),
-            ("new size second (s)", lambda r: r["timings_s"].get("new_size_second")),
-            ("img2img first (s)", lambda r: r["timings_s"].get("img2img_first")),
-            ("img2img second (s)", lambda r: r["timings_s"].get("img2img_second")),
-            (
-                "peak VRAM batch 10 alloc/reserved (GiB)",
-                lambda r: (
-                    "{peak_allocated_gib}/{peak_reserved_gib}".format(**r["memory"]["batch_10"])
-                    if (r.get("memory") or {}).get("batch_10")
-                    else None
-                ),
-            ),
-            ("OOM batch limits", lambda r: r.get("batch_limits") or "none"),
-        ]
         lines += [
             "## Performance",
             "",
             "| | " + " | ".join(names) + " |",
             "|---|" + "---|" * len(names),
         ]
-        for label, get in rows:
-            cells = []
-            for name in names:
-                result = profiles[name]
-                cells.append("error" if "error" in result else _fmt(get(result)))
+        for label, get in ROWS:
+            cells = ["error" if "error" in profiles[n] else str(get(profiles[n])) for n in names]
             lines.append(f"| {label} | " + " | ".join(cells) + " |")
-        errors = {n: r["error"] for n, r in profiles.items() if "error" in r}
-        for name, error in errors.items():
-            lines.append(f"\n- **{name} failed:** {error}")
-        first = next(iter(profiles.values()))
-        if "steps" in first:
-            lines.append(
-                f"\nSettings: {first['steps']} steps, {first['size'][0]}x{first['size'][1]} "
-                f"(new size {first['alt_size'][0]}x{first['alt_size'][1]})."
-            )
+        lines += [f"\n- **{n} failed:** {r['error']}" for n, r in profiles.items() if "error" in r]
+        if settings := next((r["settings"] for r in profiles.values() if "settings" in r), None):
+            lines.append(f"\nSettings: {settings}.")
+        choice, reason = recommend(profiles)
         lines += ["", f"**Recommended default profile:** {choice or '—'} — {reason}", ""]
     if checks is not None:
-        passed = sum(c.ok for c in checks)
-        lines += [
-            "## Functional checks",
-            "",
-            f"{passed}/{len(checks)} passed.",
-            "",
-            "| check | result | detail |",
-            "|---|---|---|",
-        ]
+        lines += ["## Functional checks", "", f"{sum(c.ok for c in checks)}/{len(checks)} passed.",
+                  "", "| check | result | detail |", "|---|---|---|"]  # fmt: skip
         for c in checks:
             detail = c.detail.replace("|", "\\|")
             lines.append(f"| {c.name} | {'ok' if c.ok else '**FAIL**'} | {detail} |")
@@ -473,13 +368,6 @@ def render_report(
             lines += ["", f"Contact sheet for visual review: `{sheet}`"]
         lines.append("")
     return "\n".join(lines)
-
-
-def environment_rows(diagnostics: list[Any]) -> list[tuple[str, str]]:
-    rows = [(c.name, c.value) for c in diagnostics]
-    if not any(name == "Python" for name, _ in rows):
-        rows.insert(0, ("Python", platform.python_version()))
-    return rows
 
 
 def default_report_name(family: str) -> str:

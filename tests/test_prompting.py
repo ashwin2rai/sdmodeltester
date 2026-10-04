@@ -7,7 +7,6 @@ from src.prompting import (
     PromptSyntaxError,
     chunk_count,
     chunk_tokens,
-    has_dynamic_groups,
     parse_template,
     parse_weighted,
     resolve_prompt_pair,
@@ -18,7 +17,6 @@ from src.prompting import (
 
 def test_plain_prompt_is_unchanged():
     assert resolve_template("a cat, (fur:1.2)", random.Random(0)) == "a cat, (fur:1.2)"
-    assert not has_dynamic_groups("a cat")
 
 
 def test_alternatives_are_trimmed():

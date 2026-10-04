@@ -339,6 +339,20 @@ def resolve_job(
     )
 
 
+def describe_request(job: ResolvedGenerationJob) -> list[str]:
+    """Human-readable job summary for logs: settings, then per-image prompts if dynamic."""
+    req = job.request
+    strength = f" · strength {req.strength}" if req.input_image else ""
+    lines = [
+        f"{req.mode} · {SAMPLER_LABELS[req.sampler]} · {req.steps} steps · "
+        f"{req.width}x{req.height} · CFG {req.guidance_scale}{strength} · "
+        f"{req.num_images} image(s) · seeds {', '.join(map(str, job.seeds))}"
+    ]
+    if any(spec.prompt != req.prompt for spec in job.images):
+        lines += [f"image {s.index + 1} (seed {s.seed}): {s.prompt}" for s in job.images]
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Input-image preprocessing
 # ---------------------------------------------------------------------------
@@ -475,6 +489,57 @@ class MicroBatcher:
         return results
 
 
+class _BatchedBackend:
+    """Shared job loop: preprocess the input, micro-batch with OOM fallback, save PNGs.
+
+    Subclasses provide ``loaded``, ``batcher`` and ``_render(req, batch, source, on_step)``
+    returning (or yielding) one PIL image per spec, plus ``_is_oom`` / ``_on_oom``.
+    """
+
+    def generate(
+        self,
+        job: ResolvedGenerationJob,
+        output_dir: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> GenerationResult:
+        if not self.loaded:
+            raise GenerationError("Backend is not loaded")
+        req = job.request
+        started, now = time.monotonic(), datetime.now()
+        source = (
+            preprocess_image(req.input_image, req.width, req.height) if req.input_image else None
+        )
+        written: list[Path] = []
+
+        def run_batch(batch: Sequence[ResolvedImageSpec], on_step) -> list[Path]:
+            for spec, image in zip(batch, self._render(req, batch, source, on_step), strict=True):
+                name = output_filename(job.job_id, spec.index, spec.seed, now)
+                written.append(collision_safe_path(output_dir, name))
+                save_png(image, written[-1])
+            return written[-len(batch) :]
+
+        try:
+            paths = self.batcher.run(
+                (req.mode, req.width, req.height),
+                job.images,
+                run_batch,
+                is_oom=self._is_oom,
+                progress_callback=progress_callback,
+                on_oom=self._on_oom,
+            )
+        except Exception as exc:
+            raise GenerationError(f"{type(exc).__name__}: {exc}", written) from exc
+        return GenerationResult(
+            output_paths=tuple(paths),
+            seeds=job.seeds,
+            resolved_prompts=tuple(spec.prompt for spec in job.images),
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    def _on_oom(self, failed: int, next_size: int) -> None:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Mock backend (SPEC §15): no torch, no diffusers, no network, no GPU
 # ---------------------------------------------------------------------------
@@ -484,7 +549,7 @@ class MockOutOfMemory(RuntimeError):
     """Simulated CUDA OOM raised when a mock batch exceeds ``max_batch``."""
 
 
-class MockBackend:
+class MockBackend(_BatchedBackend):
     """Implements the backend contract with placeholder PNGs drawn by Pillow.
 
     ``step_seconds`` / ``load_seconds`` add delays so queue/progress UI is observable.
@@ -511,7 +576,8 @@ class MockBackend:
         self.fail_load = fail_load
         self.fail_after_images = fail_after_images
         self.batcher = MicroBatcher()
-        self.batch_sizes: list[int] = []  # every attempted batch size, for tests/logs
+        self.batch_sizes: list[int] = []  # every attempted batch size, for tests
+        self.images_drawn = 0
         self.loaded = False
         self.load_count = 0
 
@@ -527,68 +593,25 @@ class MockBackend:
         self.loaded = True
 
     def warmup(self, status_callback: StatusCallback | None = None) -> None:
-        status = status_callback or (lambda state, message: None)
-        status("warming", "Warm-up 1/1…")
+        (status_callback or (lambda state, message: None))("warming", "Warm-up 1/1…")
         time.sleep(self.load_seconds)
 
-    def generate(
-        self,
-        job: ResolvedGenerationJob,
-        output_dir: Path,
-        progress_callback: ProgressCallback | None = None,
-    ) -> GenerationResult:
-        if not self.loaded:
-            raise GenerationError("Backend is not loaded")
-        req = job.request
-        started = time.monotonic()
-        now = datetime.now()
-        source = (
-            preprocess_image(req.input_image, req.width, req.height)
-            if req.input_image is not None
-            else None
-        )
+    def _is_oom(self, exc: BaseException) -> bool:
+        return isinstance(exc, MockOutOfMemory)
+
+    def _render(self, req, batch, source, on_step):
+        self.batch_sizes.append(len(batch))
+        if self.max_batch is not None and len(batch) > self.max_batch:
+            raise MockOutOfMemory(f"mock OOM at batch size {len(batch)}")
         total_steps = denoising_steps(req)
-        written: list[Path] = []
-
-        def run_batch(
-            batch: Sequence[ResolvedImageSpec], on_step: Callable[[int, int], None]
-        ) -> list[Path]:
-            self.batch_sizes.append(len(batch))
-            if self.max_batch is not None and len(batch) > self.max_batch:
-                raise MockOutOfMemory(f"mock OOM at batch size {len(batch)}")
-            for step in range(1, total_steps + 1):
-                time.sleep(self.step_seconds)
-                on_step(step, total_steps)
-            paths = []
-            for spec in batch:
-                if self.fail_after_images is not None and len(written) >= self.fail_after_images:
-                    raise RuntimeError("Simulated mock generation failure")
-                image = self._draw(spec, req, source)
-                path = collision_safe_path(
-                    output_dir, output_filename(job.job_id, spec.index, spec.seed, now)
-                )
-                save_png(image, path)
-                written.append(path)
-                paths.append(path)
-            return paths
-
-        try:
-            paths = self.batcher.run(
-                (req.mode, req.width, req.height),
-                job.images,
-                run_batch,
-                is_oom=lambda exc: isinstance(exc, MockOutOfMemory),
-                progress_callback=progress_callback,
-            )
-        except Exception as exc:
-            raise GenerationError(str(exc), written) from exc
-
-        return GenerationResult(
-            output_paths=tuple(paths),
-            seeds=job.seeds,
-            resolved_prompts=tuple(spec.prompt for spec in job.images),
-            elapsed_seconds=time.monotonic() - started,
-        )
+        for step in range(1, total_steps + 1):
+            time.sleep(self.step_seconds)
+            on_step(step, total_steps)
+        for spec in batch:  # a generator, so a simulated failure leaves earlier PNGs written
+            if self.fail_after_images is not None and self.images_drawn >= self.fail_after_images:
+                raise RuntimeError("Simulated mock generation failure")
+            self.images_drawn += 1
+            yield self._draw(spec, req, source)
 
     def _draw(
         self, spec: ResolvedImageSpec, req: GenerationRequest, source: Image.Image | None
@@ -597,24 +620,12 @@ class MockBackend:
         if source is None:
             image = Image.new("RGB", (req.width, req.height), color)
         else:
-            tint = Image.new("RGB", source.size, color)
-            image = Image.blend(source, tint, req.strength * 0.6)
-
-        draw = ImageDraw.Draw(image)
+            image = Image.blend(source, Image.new("RGB", source.size, color), req.strength * 0.6)
+        # No batch index: like the real backend, an image depends only on seed/prompt/mode.
+        text = f"MOCK {self.family.upper()} · {req.mode}\nseed {spec.seed}\n{spec.prompt[:60]}"
         font = ImageFont.load_default(size=max(12, req.width // 24))
-        lines = [
-            f"MOCK {self.family.upper()} · {req.mode}",
-            f"seed {spec.seed}",  # no batch index: image depends only on seed/prompt
-            spec.prompt[:60],
-        ]
-        draw.multiline_text(
-            (16, 16),
-            "\n".join(lines),
-            fill="white",
-            font=font,
-            spacing=6,
-            stroke_width=2,
-            stroke_fill="black",
+        ImageDraw.Draw(image).multiline_text(
+            (16, 16), text, fill="white", font=font, spacing=6, stroke_width=2, stroke_fill="black"
         )
         return image
 
@@ -650,7 +661,7 @@ def make_scheduler(sampler: str, base_config: Any) -> Any:
     return getattr(diffusers, class_name).from_config(base_config, **overrides)
 
 
-class DiffusersBackend:
+class DiffusersBackend(_BatchedBackend):
     """Single-file SD1.5/SDXL checkpoint kept resident on the GPU.
 
     ``pipeline_loader`` replaces ``from_single_file`` (tests inject tiny random
@@ -691,6 +702,10 @@ class DiffusersBackend:
         self._original_modules: dict[str, Any] = {}
         self._seen_shapes: set[BatchKey] = set()
         self.load_count = 0
+
+    @property
+    def loaded(self) -> bool:
+        return self.txt2img is not None
 
     # -- loading -------------------------------------------------------------
 
@@ -819,21 +834,22 @@ class DiffusersBackend:
         self._run_pipeline(req, [spec], None, lambda step, total: None)
         self._seen_shapes.add((req.mode, req.width, req.height))
 
-    # -- generation ----------------------------------------------------------
+    # -- generation (job loop in _BatchedBackend) ------------------------------
 
-    def generate(
-        self,
-        job: ResolvedGenerationJob,
-        output_dir: Path,
-        progress_callback: ProgressCallback | None = None,
-    ) -> GenerationResult:
-        if self.txt2img is None:
-            raise GenerationError("Backend is not loaded")
+    def _is_oom(self, exc: BaseException) -> bool:
         import torch
 
-        req = job.request
-        started = time.monotonic()
-        now = datetime.now()
+        return isinstance(exc, torch.OutOfMemoryError)
+
+    def _on_oom(self, failed: int, next_size: int) -> None:
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.log(f"CUDA out of memory at batch {failed}; retrying with batch {next_size}")
+
+    def _render(self, req, batch, source, on_step):
         key: BatchKey = (req.mode, req.width, req.height)
         if self.active_optimization != "baseline" and key not in self._seen_shapes:
             self.log(
@@ -841,51 +857,7 @@ class DiffusersBackend:
                 "first generation at this size may be slower."
             )
         self._seen_shapes.add(key)
-        source = (
-            preprocess_image(req.input_image, req.width, req.height)
-            if req.input_image is not None
-            else None
-        )
-        written: list[Path] = []
-
-        def run_batch(
-            batch: Sequence[ResolvedImageSpec], on_step: Callable[[int, int], None]
-        ) -> list[Path]:
-            images = self._run_pipeline(req, batch, source, on_step)
-            paths = []
-            for spec, image in zip(batch, images, strict=True):
-                path = collision_safe_path(
-                    output_dir, output_filename(job.job_id, spec.index, spec.seed, now)
-                )
-                save_png(image, path)
-                written.append(path)
-                paths.append(path)
-            return paths
-
-        def on_oom(failed: int, next_size: int) -> None:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self.log(f"CUDA out of memory at batch {failed}; retrying with batch {next_size}")
-
-        try:
-            paths = self.batcher.run(
-                key,
-                job.images,
-                run_batch,
-                is_oom=lambda exc: isinstance(exc, torch.OutOfMemoryError),
-                progress_callback=progress_callback,
-                on_oom=on_oom,
-            )
-        except Exception as exc:
-            raise GenerationError(f"{type(exc).__name__}: {exc}", written) from exc
-
-        return GenerationResult(
-            output_paths=tuple(paths),
-            seeds=job.seeds,
-            resolved_prompts=tuple(spec.prompt for spec in job.images),
-            elapsed_seconds=time.monotonic() - started,
-        )
+        return self._run_pipeline(req, batch, source, on_step)
 
     def _run_pipeline(
         self,
@@ -909,7 +881,7 @@ class DiffusersBackend:
         # One generator per image: an image depends only on its own seed (SPEC §10).
         generators = [torch.Generator(device=self.device).manual_seed(s.seed) for s in batch]
 
-        def callback(pipeline: Any, step_index: int, timestep: Any, kwargs: dict) -> dict:
+        def callback(pipeline: Any, step_index: int, _timestep: Any, kwargs: dict) -> dict:
             on_step(step_index + 1, pipeline.num_timesteps)
             return kwargs
 

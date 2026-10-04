@@ -7,6 +7,7 @@ run one at a time on a single worker.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import logging
 import os
@@ -28,14 +29,13 @@ from werkzeug.utils import secure_filename
 
 from src.backend import (
     FAMILY_DEFAULTS,
-    SAMPLER_LABELS,
     SAMPLERS,
     Backend,
-    GenerationError,
     GenerationRequest,
     ResolvedGenerationJob,
     ValidationError,
     collision_safe_path,
+    describe_request,
     resolve_job,
 )
 
@@ -59,11 +59,10 @@ ACCEPTING_STATES = {"starting", "loading", "optimizing", "warming", "ready"}
 class JobRecord:
     id: int
     job: ResolvedGenerationJob
-    status: str = "queued"  # queued | waiting_for_model | running | done | error | cancelled
+    status: str = "queued"  # queued | waiting_for_model | running | done | error
     message: str = "Queued"
     progress: float = 0.0
     outputs: list[str] = field(default_factory=list)
-    error: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -173,7 +172,7 @@ class ServerState:
             self.backend_state = "error"
             self.backend_message = "Backend failed to load"
             self.backend_error = error
-            drained = self._drain_queue("failed")
+            drained = self._drain_queue()
         self.log(f"Backend error: {error}")
         if drained:
             self.log(f"Failed {drained} pending job(s): backend unavailable")
@@ -201,26 +200,20 @@ class ServerState:
             self.log(f"Job {job_id}: {note}")
         return record
 
-    def _drain_queue(self, status: str) -> int:
+    def _drain_queue(self) -> int:
         count = 0
         while True:
             try:
-                record = self.queue.get_nowait()
+                self.queue.get_nowait()
             except queue.Empty:
                 return count
-            record.status = status
-            record.message = "Cleared" if status == "cancelled" else "Backend unavailable"
             count += 1
 
     def clear_queue(self) -> int:
         with self.lock:
-            count = self._drain_queue("cancelled")
+            count = self._drain_queue()
         self.log(f"Cleared {count} pending job(s)")
         return count
-
-    def is_busy(self) -> bool:
-        with self.lock:
-            return self.current is not None or not self.queue.empty()
 
     # -- worker ------------------------------------------------------------------
 
@@ -231,8 +224,6 @@ class ServerState:
             except queue.Empty:
                 continue
             with self.lock:
-                if record.status != "queued":
-                    continue
                 self.current = record
                 if not self.ready.is_set():
                     record.status = "waiting_for_model"
@@ -249,22 +240,12 @@ class ServerState:
     def _run(self, record: JobRecord) -> None:
         if self.backend_state == "error":
             record.status, record.message = "error", "Backend unavailable"
-            record.error = self.backend_error
             self.log(f"Job {record.id}: failed — backend unavailable")
             return
-
-        req = record.job.request
-        mode = req.mode
-        extra = f" · strength {req.strength}" if req.input_image else ""
         with self.lock:
             record.status, record.message = "running", "Starting…"
-        self.log(
-            f"Job {record.id}: {mode} · {SAMPLER_LABELS[req.sampler]} · {req.steps} steps · "
-            f"{req.width}x{req.height} · CFG {req.guidance_scale}{extra}"
-        )
-        if any(spec.prompt != req.prompt for spec in record.job.images):
-            for spec in record.job.images:
-                self.log(f"Job {record.id}: image {spec.index + 1} prompt: {spec.prompt}")
+        for line in describe_request(record.job):
+            self.log(f"Job {record.id}: {line}")
 
         def progress(fraction: float, message: str) -> None:
             with self.lock:
@@ -273,12 +254,9 @@ class ServerState:
 
         try:
             result = self.backend.generate(record.job, self.outputs_dir, progress)
-        except GenerationError as exc:
-            self._job_failed(record, str(exc), exc.completed_paths)
-            return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — backends raise GenerationError
             traceback.print_exc()
-            self._job_failed(record, f"{type(exc).__name__}: {exc}", ())
+            self._job_failed(record, str(exc), getattr(exc, "completed_paths", ()))
             return
 
         with self.lock:
@@ -291,7 +269,7 @@ class ServerState:
 
     def _job_failed(self, record: JobRecord, error: str, completed: tuple[Path, ...]) -> None:
         with self.lock:
-            record.status, record.message, record.error = "error", "Failed", error
+            record.status, record.message = "error", "Failed"
             record.outputs = [path.name for path in completed]
         self.log(f"Job {record.id}: error — {error}")
         if completed:
@@ -369,14 +347,8 @@ def safe_child(directory: Path, name: Any, extensions: set[str]) -> Path | None:
 def secure_delete(path: Path) -> None:
     """Best-effort overwrite-before-unlink. Cannot defeat SSD wear levelling, snapshots,
     journaling, or cloud infrastructure copies."""
-    size = path.stat().st_size
     with open(path, "r+b") as fh:
-        remaining = size
-        chunk = 1 << 20
-        while remaining > 0:
-            n = min(chunk, remaining)
-            fh.write(os.urandom(n))
-            remaining -= n
+        fh.write(os.urandom(path.stat().st_size))  # files are small: uploads cap at 50 MB
         fh.flush()
         os.fsync(fh.fileno())
     path.unlink()
@@ -395,17 +367,6 @@ def clear_directory(directory: Path) -> int:
 # ---------------------------------------------------------------------------
 # Request parsing
 # ---------------------------------------------------------------------------
-
-REQUEST_FIELDS = {
-    "width",
-    "height",
-    "steps",
-    "guidance_scale",
-    "sampler",
-    "seed",
-    "num_images",
-    "strength",
-}
 
 
 def request_from_json(data: Any, family: str, inputs_dir: Path) -> GenerationRequest:
@@ -469,23 +430,12 @@ def create_app(state: ServerState) -> Flask:
 
     @app.get("/api/config")
     def config():
-        d = FAMILY_DEFAULTS[family]
         return jsonify(
             {
                 "model_family": family,
                 "model_name": state.backend.model_name,
-                "defaults": {
-                    "width": d.width,
-                    "height": d.height,
-                    "steps": d.steps,
-                    "guidance_scale": d.guidance_scale,
-                    "sampler": d.sampler,
-                    "seed": d.seed,
-                    "num_images": d.num_images,
-                    "strength": d.strength,
-                },
+                "defaults": dataclasses.asdict(FAMILY_DEFAULTS[family]),
                 "samplers": [{"id": sid, "label": label} for sid, label in SAMPLERS],
-                "max_queue": state.queue.maxsize,
             }
         )
 
@@ -505,17 +455,20 @@ def create_app(state: ServerState) -> Flask:
     def outputs():
         return jsonify({"files": list_files(state.outputs_dir, OUTPUT_EXTENSIONS)})
 
-    @app.get("/inputs/<name>")
-    def input_file(name: str):
-        if safe_child(state.inputs_dir, name, INPUT_EXTENSIONS) is None:
+    def serve_file(directory: Path, name: str, extensions: set[str]):
+        if safe_child(directory, name, extensions) is None:
             return _error("not found", 404)
-        return send_from_directory(state.inputs_dir.resolve(), name)
+        return send_from_directory(directory.resolve(), name)
 
-    @app.get("/outputs/<name>")
-    def output_file(name: str):
-        if safe_child(state.outputs_dir, name, OUTPUT_EXTENSIONS) is None:
-            return _error("not found", 404)
-        return send_from_directory(state.outputs_dir.resolve(), name)
+    for kind, directory, extensions in (
+        ("inputs", state.inputs_dir, INPUT_EXTENSIONS),
+        ("outputs", state.outputs_dir, OUTPUT_EXTENSIONS),
+    ):
+        app.add_url_rule(
+            f"/{kind}/<name>",
+            f"{kind}_file",
+            lambda name, d=directory, e=extensions: serve_file(d, name, e),
+        )
 
     @app.post("/api/upload")
     def upload():
@@ -563,17 +516,7 @@ def create_app(state: ServerState) -> Flask:
             return _error(f"backend unavailable: {exc}", 503)
         except QueueFull as exc:
             return _error(str(exc), 429)
-        job = record.job
-        return jsonify(
-            {
-                "job_id": record.id,
-                "seeds": list(job.seeds),
-                "prompts": [spec.prompt for spec in job.images],
-                "corrections": list(job.corrections),
-                "queue_length": state.queue.qsize(),
-                "waiting_for_model": not state.ready.is_set(),
-            }
-        )
+        return jsonify({"job_id": record.id, "seeds": list(record.job.seeds)})
 
     @app.delete("/api/queue")
     def clear_queue():

@@ -62,19 +62,20 @@ uv run python -m src.cli generate --model-family sdxl --model models/x.safetenso
 uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # open http://127.0.0.1:8000
 ```
 
-### Benchmark (Phase 8, run on the Colab L4)
+### Benchmark (Phase 8, run on the L4)
 
 ```bash
 python -m src.cli benchmark --model-family sdxl --model models/x.safetensors \
     --profiles baseline,compile,compile-max
 ```
 
-Each profile runs in a fresh process: cold load, compile/warm-up, warm single-image
-latency (×3), batch 5/10, a new resolution, img2img, and peak VRAM. The verify profile
-(default: the first) also runs the functional matrix (all samplers, seeds, prompt syntax,
-img2img, batching, black-image detection). Output: `compat/benchmark-<family>-<date>.md`
-(+ `.json`) with a recommended default profile, and a contact sheet of every check image
-in `outputs/benchmark/` for visual review. `--mock` exercises the same flow without a GPU.
+Profiles run one after another, each with a fresh backend: cold load, compile/warm-up,
+warm single-image latency (×3), batch 5/10, a new resolution, img2img, peak VRAM. The first
+profile also runs the functional matrix (all samplers, seeds, prompt syntax, img2img,
+batching, black-image detection). Output: `compat/benchmark-<family>-<date>.md` with a
+recommended default profile, plus a contact sheet in `outputs/benchmark/` for visual review.
+On Colab, run it from a terminal or a scratch cell in `/content/sdmodeltester` after stopping
+the UI server (it needs the VRAM).
 
 Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength`) use the
 model family's defaults. `generate` prints output paths on stdout and progress on stderr.
@@ -85,24 +86,19 @@ capability), 2 invalid arguments or request.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ashwin2rai/sdmodeltester/blob/main/notebooks/colab.ipynb)
 
-`notebooks/colab.ipynb` is self-contained and shareable. It is only an orchestrator: it
-clones this repo, installs the app-level libraries on top of Colab's own Python/CUDA/PyTorch
-(it never reinstalls torch), runs `doctor`, downloads one checkpoint, starts
-`python -m src.cli serve` in the background, and embeds the UI with Colab's built-in kernel
-proxy (no ngrok/Cloudflare). It talks to the app only through the CLI, and stays quiet: one
-✓ line per cell, details only on failure, and never any prompts, images or server log
-(that goes to `server.log`; loading progress and errors show in the UI itself).
+`notebooks/colab.ipynb` is a minimal, shareable orchestrator (4 small cells): settings →
+clone this repo + install app libraries on top of Colab's own torch + `doctor` → download
+one checkpoint → `python -m src.cli serve` in the background with the UI embedded through
+Colab's built-in kernel proxy. It prints one ✓ line per step and nothing from the UI; the
+server log is in `/content/sdmodeltester/server.log`.
 
-- **Model sources**: Hugging Face file links (`hf_hub_download`), Civitai model pages or
-  download links (resolved through the Civitai API, SHA256-verified), direct URLs, or a
-  local/Drive path. Downloads resume after interruptions and must be real `.safetensors`
-  checkpoints; a family mismatch is warned about.
-- **Tokens**: Colab Secrets `HF_TOKEN` / `CIVITAI_TOKEN` are used first, so shared copies
-  of the notebook never contain anyone's token.
-- **Demo mode** runs the whole UI with placeholder images on any runtime (no GPU/model).
-- Cell 7 runs the Phase 8 benchmark (`benchmark --quiet`) and shows the report + contact sheet.
+- `MODEL_URL`: a Hugging Face file link (`hf_hub_download`) or a Civitai link that includes
+  the version (`?modelVersionId=…` or `/api/download/models/<id>`); the file must be a
+  full-size `.safetensors` checkpoint.
+- Tokens: Colab Secrets `HF_TOKEN` / `CIVITAI_TOKEN` are used first, so shared copies never
+  contain anyone's token.
 
-Notebook helpers live in `notebooks/colab_utils.py` (operational code, not part of `src/`).
+Helpers live in `notebooks/colab_utils.py` (notebook-only, never imported by `src/`).
 `requirements-inference.txt` intentionally does **not** list torch — see
 [`objectives/COLAB_COMPATIBILITY.md`](objectives/COLAB_COMPATIBILITY.md).
 

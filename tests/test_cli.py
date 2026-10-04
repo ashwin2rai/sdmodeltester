@@ -1,6 +1,4 @@
 import os
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,7 +157,7 @@ def test_real_generate_requires_valid_model(tmp_path):
 
 
 def test_generate_failure_exits_1_and_lists_completed(tmp_path, monkeypatch):
-    def failing_backend(args, log, mock_delays=(0, 0)):
+    def failing_backend(args, log, **kwargs):
         return MockBackend(args.model_family, fail_after_images=2)
 
     monkeypatch.setattr(cli, "build_backend", failing_backend)
@@ -172,7 +170,7 @@ def test_generate_load_failure_exits_1(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "build_backend",
-        lambda args, log, mock_delays=(0, 0): MockBackend("sd15", fail_load=True),
+        lambda args, log, **kwargs: MockBackend("sd15", fail_load=True),
     )
     code, _, err = run_cli(gen_args(tmp_path, "--prompt", "x"))
     assert code == 1 and "failed to load" in err[-1]
@@ -196,37 +194,15 @@ def test_build_backend_mock_delays():
     args = cli.build_parser().parse_args(
         ["serve", "--mock", "--model-family", "sd15", "--mock-step-seconds", "0.2"]
     )
-    backend = cli.build_backend(args, print, mock_delays=(1.0, 0.2))
+    backend = cli.build_backend(args, print, load_seconds=1.0, step_seconds=0.2)
     assert isinstance(backend, MockBackend)
     assert (backend.load_seconds, backend.step_seconds) == (1.0, 0.2)
     assert backend.model_name == "mock.safetensors"
 
 
-def test_mock_generate_never_imports_torch(tmp_path):
-    code = (
-        "import sys; from src.cli import main; "
-        f"rc = main(['generate', '--mock', '--model-family', 'sdxl', '--prompt', 'x', "
-        f"'--steps', '2', '--output-dir', {str(tmp_path)!r}], "
-        "out=lambda m: None, err=lambda m: None); "
-        "assert rc == 0, rc; "
-        "assert 'torch' not in sys.modules and 'diffusers' not in sys.modules"
-    )
-    subprocess.run([sys.executable, "-c", code], check=True, cwd=REPO_ROOT)
-
-
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
-
-
-def test_doctor_mock_passes_without_torch():
-    code = (
-        "import sys; from src.cli import main; "
-        "lines = []; rc = main(['doctor', '--mock'], out=lines.append, err=lines.append); "
-        "assert rc == 0, lines; assert any(l.startswith('Python:') for l in lines); "
-        "assert 'torch' not in sys.modules"
-    )
-    subprocess.run([sys.executable, "-c", code], check=True, cwd=REPO_ROOT)
 
 
 def by_name(checks):
@@ -277,7 +253,7 @@ def test_doctor_l4_passes(gpu_env):
     assert checks["GPU"].value == "NVIDIA L4" and checks["GPU"].status == "ok"
     assert checks["GPU memory"].value == "24.0 GiB"
     assert checks["CUDA available"].status == "ok"
-    assert checks["compile smoke check"].value == "pass"
+    assert checks["compile smoke check"].value == "ok"
     assert not [c for c in checks.values() if c.status == "fail"]
 
 

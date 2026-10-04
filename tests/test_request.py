@@ -7,6 +7,7 @@ from src.backend import (
     FAMILY_DEFAULTS,
     MAX_SEED,
     SAMPLER_IDS,
+    SAMPLER_SCHEDULERS,
     ValidationError,
     check_family,
     collision_safe_path,
@@ -149,3 +150,10 @@ def test_collision_safe_path(tmp_path):
     assert collision_safe_path(tmp_path, "a.png") == tmp_path / "a_1.png"
     (tmp_path / "a_1.png").touch()
     assert collision_safe_path(tmp_path, "a.png") == tmp_path / "a_2.png"
+
+
+def test_every_sampler_has_an_explicit_scheduler_mapping():
+    assert set(SAMPLER_SCHEDULERS) == set(SAMPLER_IDS)
+    for sampler, (_, overrides) in SAMPLER_SCHEDULERS.items():
+        if sampler != "euler_a":  # EulerAncestralDiscreteScheduler has no karras option
+            assert overrides["use_karras_sigmas"] == sampler.endswith("_karras"), sampler

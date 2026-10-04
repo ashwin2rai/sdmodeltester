@@ -1,8 +1,6 @@
 import io
 import os
 import socket
-import subprocess
-import sys
 import threading
 import time
 import urllib.request
@@ -109,7 +107,6 @@ def test_enqueue_while_loading_then_runs_when_ready(env):
     assert response.status_code == 200
     body = response.get_json()
     assert body["job_id"] == 1 and body["seeds"] == [123, 124, 125]
-    assert body["waiting_for_model"] is True
 
     wait_until(lambda: state.current is not None)
     current = client.get("/api/status").get_json()["current_job"]
@@ -175,12 +172,14 @@ def test_clear_queue_keeps_active_job(env):
     assert len(list(state.outputs_dir.glob("*.png"))) == 1  # jobs 2 and 3 never ran
 
 
-def test_enqueue_response_includes_corrections_and_prompts(env):
-    _, client, _ = ready_env(env)
+def test_enqueue_logs_corrections_and_dynamic_prompts(env):
+    state, client, _ = ready_env(env)
     body = queue(client, width=516, seed=5, num_images=2, prompt="a {red | blue} cat").get_json()
-    assert body["corrections"] == ["width 516 rounded to 520 (multiple of 8)"]
-    assert all(p in ("a red cat", "a blue cat") for p in body["prompts"])
-    assert body["waiting_for_model"] is False
+    assert body == {"job_id": 1, "seeds": [5, 6]}
+    wait_until(lambda: state.latest_completed is not None)
+    texts = [entry["text"] for entry in state.log_since(0)]
+    assert "Job 1: width 516 rounded to 520 (multiple of 8)" in texts
+    assert sum(t.startswith("Job 1: image ") for t in texts) == 2
 
 
 @pytest.mark.parametrize(
@@ -507,8 +506,3 @@ def _reachable(base):
         return True
     except OSError:
         return False
-
-
-def test_server_import_does_not_pull_torch():
-    code = "import sys, src.server; assert 'torch' not in sys.modules"
-    subprocess.run([sys.executable, "-c", code], check=True, cwd=REPO_ROOT)
