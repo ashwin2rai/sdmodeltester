@@ -33,7 +33,7 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   transformers bounds in `requirements-inference.txt`); also jax 0.11.1, numba 0.61.2,
   pandas 2.2.3. The torch version wasn't listed; `doctor` / Phase 8 must record it.
 - Setup: `uv sync` then `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`.
-  Everything incl. optional groups: `uv run --all-groups pytest` (~45 s, 223 tests at Phase 6).
+  Everything incl. optional groups: `uv run --all-groups pytest` (~70 s, 247 tests at Phase 8a).
 - **Optional UI test stack**: `ui` group = playwright (1.63). Chromium headless shell in
   `~/.cache/ms-playwright` (~270 MB) via `playwright install chromium --only-shell`; the
   Codespace needed system libs once: `sudo .venv/bin/playwright install-deps
@@ -63,9 +63,10 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | committed; Colab-only parts pending Phase 8 |
 | 4 | CLI: doctor / generate / serve | committed |
 | 5 | Queue + HTTP API | committed |
-| 6 | UI (`src/static/index.html`) + headless-browser tests | **done — awaiting owner review/commit** |
-| 7 | Local/mock verification | not started |
-| 8 | L4 tuning + `compat/known-good-colab.md` | needs Colab |
+| 6 | UI (`src/static/index.html`) + headless-browser tests | committed (owner checked the UI by hand: OK) |
+| 7 | Local/mock verification | effectively done via automated tests (mock, CPU-tiny, browser) |
+| 8a | Phase 8 tooling: `benchmark` CLI (profiles + functional matrix + report) | **done — awaiting owner review/commit** |
+| 8b | Run the benchmark on a real L4 for SD1.5 + SDXL, pick the default profile, write `compat/known-good-colab.md` | needs Colab |
 | 9 | Colab notebook | needs Colab, last |
 
 ## What exists
@@ -94,13 +95,18 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `collect_diagnostics(mock, model, family, compile_check) -> list[Check]`, `format_checks`,
   `cmd_doctor` / `cmd_generate` / `cmd_serve`, `UsageError`. `serve` calls
   `src.server.serve(backend, host, port, inputs_dir, outputs_dir)`; Phase 5 must provide it.
+- `src/benchmark.py` (Phase 8a): `benchmark_profile(backend, family, out, profile, steps, size,
+  alt_size, log)`, `functional_checks(...) -> list[Check]`, `contact_sheet`, `recommend`,
+  `render_report`, `is_black`, `max_pixel_diff`, `default_report_name`. CLI: `cmd_benchmark`
+  (+ `_run_profile`, `_run_profile_subprocess`, `_strip_profile_args`; hidden `--child-json`).
+  Backends gained `load_count`; DiffusersBackend gained `reset_peak_memory()` / `memory_stats()`.
 - `src/static/index.html` (Phase 6): the whole UI, inline CSS/JS, no build step.
 - `src/server.py` (Phase 5): `ServerState(backend, inputs_dir, outputs_dir, max_queue, echo)`
   with `start/stop/enqueue/clear_queue/status/log/log_since/is_busy`; `JobRecord`;
   `create_app(state)`; `serve(backend, host, port, inputs_dir, outputs_dir)`;
   `request_from_json`, `list_files`, `safe_child`, `secure_delete`, `clear_directory`,
   `format_seeds`; `MAX_QUEUE = 5`. `src/static/index.html` is a placeholder.
-- Tests: `test_ui.py` (ui marker; Playwright), `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
+- Tests: `test_benchmark.py`, `test_ui.py` (ui marker; Playwright), `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
   `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
   `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
   (1 module skipped); 210 pass with `--group inference-cpu` in ~18 s.
@@ -304,7 +310,60 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   no horizontal overflow at 360px. 3 repeat runs passed; an innerHTML bug is caught.
 - Exploration/screenshot scripts live in the scratchpad (not the repo).
 
-### Needs Colab (Phase 8) — cannot be verified locally
+### Phase 8a decisions (benchmark tooling)
+
+- `python -m src.cli benchmark --model-family F --model M [--profiles baseline,compile]
+  [--verify-profile P] [--no-functional|--no-perf] [--steps N --width W --height H]
+  [--output-dir outputs/benchmark] [--report compat/benchmark-F-DATE.md] [--in-process] [--mock]`.
+- With more than one profile, each runs in a **fresh child process** (`--child-json` internal),
+  so compile caches and VRAM never carry over. The parent never imports torch/CUDA; the
+  environment rows come from the child's `collect_diagnostics`. A crashed child is recorded
+  as `{"error": ...}` and doesn't abort the run.
+- Per profile it measures: load, warmup, warm_single_1..3 (median of #2,#3 = the warm
+  latency), batch_5, batch_10 (+ images/s), new_size_first/second (ALT_SIZES sd15 768x512,
+  sdxl 896x1152), img2img_first/second, peak VRAM (reset before each batch), learned OOM
+  batch limits.
+- **Recommendation** = lowest warm-single median among profiles that ran *and* stayed active
+  (a compile that fell back to baseline doesn't count). A compiled profile must beat baseline
+  by ≥5% (`MIN_SPEEDUP`), otherwise baseline. Startup is reported next to it.
+- **Functional matrix** (18 checks) on the verify profile's loaded backend: txt2img/img2img
+  ×1/×10, 6 samplers, seed −1, same-seed reproducibility (≤2 px diff), batch invariance
+  (≤24, informational tolerance for GPU kernels), weighted ≠ plain, dynamic, dynamic+weighted,
+  non-square, repeated singles without reload (`load_count`). **Every output image is checked
+  for black** (max channel ≤ 8), which catches the SDXL fp16 VAE NaN issue. A failing check is
+  recorded, never raised.
+- Contact sheet `outputs/benchmark/functional_contact_sheet.png` (one labelled row per check),
+  because image quality must be judged by a human. Exit code 1 if any check fails or no
+  profile completed.
+- The mock image no longer draws the batch index (only family/mode/seed/prompt), so a mock
+  image depends only on seed/prompt/mode, like the real backend; batch-invariance works on mock.
+- Benchmark images go to `outputs/benchmark/<profile>/` subdirectories: they're not listed by
+  the UI and not removed by clear-all (which skips subdirectories).
+
+### Phase 9 prep: reference notebook review (owner-provided)
+
+Reviewed `je4ngomes/fast-stable-diffusion/fast_stable_diffusion_AUTOMATIC1111_py310.ipynb`
+(A1111 on Colab with a py3.10 venv, torch 2.1.2, xformers, gradio --share).
+- **Reuse (ideas):** URL source classification (civitai / huggingface / gdrive / other);
+  Civitai filename from `Content-Disposition` (or the redirect URL's
+  `response-content-disposition` query); streamed download with a progress bar; a minimum-size
+  sanity check; a "use an existing local path (e.g. on Drive)" alternative; a quiet-on-success,
+  full-output-on-failure `run()` helper for install steps; streaming server output so errors
+  stay visible.
+- **Don't reuse (bugs/risks):** `get_name()` does a non-streaming `requests.get`, so a 200
+  response would pull a multi-GB body into RAM; no HF/Civitai token support; downloads go
+  straight to the final path (a partial file looks "already exists"; no resume); HF links via
+  gdown (a `/blob/` URL downloads HTML); the cleanup `!rm model` deletes a literal "model" file;
+  the SD1.5 default link `runwayml/stable-diffusion-v1-5` is dead (use
+  `stable-diffusion-v1-5/stable-diffusion-v1-5`); the A1111/venv/xformers/gradio setup conflicts
+  with our spec (Colab-owned torch, no xformers, built-in proxy only).
+- **Plan:** own helpers (outside `src/`, e.g. `notebooks/colab_utils.py`, unit-tested with a
+  local HTTP server): `.part` + Range resume, Bearer token never forwarded to the redirect host,
+  `hf_hub_download` for HF URLs (blob/resolve parsing), Civitai model-page →
+  `api/download/models/{versionId}` (or the v1 API for the latest version), safetensors header
+  validation (8-byte length + JSON) + a warn-only family hint from tensor key names.
+
+### Needs Colab (Phase 8b) — cannot be verified locally
 
 - `from_single_file` on real SD1.5/SDXL checkpoints (and Hub config fetch) in fp16 on CUDA.
 - SDXL fp16 VAE decode (NaN/black images): diffusers upcasts via the VAE `force_upcast`

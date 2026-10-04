@@ -513,10 +513,12 @@ class MockBackend:
         self.batcher = MicroBatcher()
         self.batch_sizes: list[int] = []  # every attempted batch size, for tests/logs
         self.loaded = False
+        self.load_count = 0
 
     def load(self, status_callback: StatusCallback | None = None) -> None:
         status = status_callback or (lambda state, message: None)
         status("loading", "Loading checkpoint (mock)…")
+        self.load_count += 1
         time.sleep(self.load_seconds)
         if self.fail_load:
             raise RuntimeError("Mock checkpoint failed to load")
@@ -602,7 +604,7 @@ class MockBackend:
         font = ImageFont.load_default(size=max(12, req.width // 24))
         lines = [
             f"MOCK {self.family.upper()} · {req.mode}",
-            f"#{spec.index + 1} · seed {spec.seed}",
+            f"seed {spec.seed}",  # no batch index: image depends only on seed/prompt
             spec.prompt[:60],
         ]
         draw.multiline_text(
@@ -688,6 +690,7 @@ class DiffusersBackend:
         self.base_scheduler_config: Any = None
         self._original_modules: dict[str, Any] = {}
         self._seen_shapes: set[BatchKey] = set()
+        self.load_count = 0
 
     # -- loading -------------------------------------------------------------
 
@@ -695,6 +698,7 @@ class DiffusersBackend:
         status = status_callback or (lambda state, message: None)
         configure_cuda_allocator()
         status("loading", "Loading checkpoint…")
+        self.load_count += 1
         started = time.monotonic()
         pipe = self.pipeline_loader() if self.pipeline_loader else self._load_single_file()
         pipe.set_progress_bar_config(disable=True)
@@ -768,6 +772,25 @@ class DiffusersBackend:
             self._set_module(name, module)
         self.active_optimization = "baseline"
         self.log(f"Optimization failed, falling back to baseline: {reason}")
+
+    # -- diagnostics -----------------------------------------------------------
+
+    def reset_peak_memory(self) -> None:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def memory_stats(self) -> dict[str, float] | None:
+        """Peak CUDA memory since the last reset, in GiB (None without CUDA)."""
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return {
+            "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+            "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 2),
+        }
 
     # -- warm-up -------------------------------------------------------------
 

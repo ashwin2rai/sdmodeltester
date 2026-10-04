@@ -61,6 +61,20 @@ uv run python -m src.cli generate --model-family sdxl --model models/x.safetenso
 uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # open http://127.0.0.1:8000
 ```
 
+### Benchmark (Phase 8, run on the Colab L4)
+
+```bash
+python -m src.cli benchmark --model-family sdxl --model models/x.safetensors \
+    --profiles baseline,compile,compile-max
+```
+
+Each profile runs in a fresh process: cold load, compile/warm-up, warm single-image
+latency (×3), batch 5/10, a new resolution, img2img, and peak VRAM. The verify profile
+(default: the first) also runs the functional matrix (all samplers, seeds, prompt syntax,
+img2img, batching, black-image detection). Output: `compat/benchmark-<family>-<date>.md`
+(+ `.json`) with a recommended default profile, and a contact sheet of every check image
+in `outputs/benchmark/` for visual review. `--mock` exercises the same flow without a GPU.
+
 Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength`) use the
 model family's defaults. `generate` prints output paths on stdout and progress on stderr.
 Exit codes: 0 success, 1 runtime/load failure (or `doctor` found a missing required

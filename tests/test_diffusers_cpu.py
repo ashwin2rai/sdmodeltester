@@ -481,3 +481,25 @@ def test_cli_generate_real_backend(tmp_path, monkeypatch):
     assert code == 0, err
     assert [Path(p).name.split("_")[-1] for p in out] == ["seed7.png", "seed8.png"]
     assert any("Loaded tiny.safetensors (sdxl)" in line for line in err)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 tooling against the real backend (tiny pipelines)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", ["sd15", "sdxl"])
+def test_benchmark_and_functional_checks_real_backend(family, tmp_path):
+    from src import benchmark
+
+    small = dict(steps=2, size=(SIZE, SIZE), alt_size=(SIZE + 16, SIZE), log=lambda m: None)
+    result = benchmark.benchmark_profile(make_backend(family), family, tmp_path / "perf", **small)
+    assert result["profile_active"] == "baseline"
+    assert result["timings_s"]["batch_10"] > 0
+    assert result["memory"]["batch_10"] is None  # CPU: no CUDA stats
+
+    backend = make_backend(family)
+    backend.load()
+    checks = benchmark.functional_checks(backend, family, tmp_path / "func", **small)
+    failed = {c.name: c.detail for c in checks if not c.ok}
+    assert failed == {}

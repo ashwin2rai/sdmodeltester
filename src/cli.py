@@ -13,12 +13,16 @@ first imported (SPEC §13.2).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import importlib.metadata
 import importlib.util
+import json
 import os
 import platform
+import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +105,33 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--image", type=Path, help="input image for image-to-image")
     gen.add_argument("--strength", type=float, help="img2img strength (default: family default)")
     gen.add_argument("--output-dir", type=Path, default=Path("outputs"))
+
+    bench = sub.add_parser(
+        "benchmark", help="Phase 8: compare optimization profiles + functional checks"
+    )
+    _add_model_args(bench, family_required=True)
+    bench.add_argument("--mock", action="store_true", help="placeholder backend: no GPU/torch")
+    bench.add_argument("--device", default="cuda", help=argparse.SUPPRESS)
+    bench.add_argument("--dtype", default="float16", help=argparse.SUPPRESS)
+    bench.add_argument(
+        "--profiles",
+        default="baseline,compile",
+        help="comma-separated optimization profiles to benchmark "
+        f"({', '.join(OPTIMIZATION_PROFILES)}; default: baseline,compile)",
+    )
+    bench.add_argument(
+        "--verify-profile",
+        help="profile whose process also runs the functional checks (default: first)",
+    )
+    bench.add_argument("--no-functional", action="store_true", help="skip functional checks")
+    bench.add_argument("--no-perf", action="store_true", help="only run functional checks")
+    bench.add_argument("--steps", type=int, help="override steps (default: family default)")
+    bench.add_argument("--width", type=int, help="override width (default: family default)")
+    bench.add_argument("--height", type=int, help="override height (default: family default)")
+    bench.add_argument("--output-dir", type=Path, default=Path("outputs/benchmark"))
+    bench.add_argument("--report", type=Path, help="Markdown report path (default: compat/…)")
+    bench.add_argument("--in-process", action="store_true", help="run all profiles in this process")
+    bench.add_argument("--child-json", type=Path, help=argparse.SUPPRESS)
 
     serve = sub.add_parser("serve", help="run the HTTP server and browser UI")
     _add_model_args(serve, family_required=True)
@@ -264,6 +295,163 @@ def cmd_serve(args: argparse.Namespace, out: Printer, err: Printer) -> int:
         outputs_dir=args.outputs_dir,
     )
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# benchmark
+# ---------------------------------------------------------------------------
+
+
+def _bench_size(args: argparse.Namespace) -> tuple[int, int] | None:
+    if args.width is None and args.height is None:
+        return None
+    d = FAMILY_DEFAULTS[args.model_family]
+    return (args.width or d.width, args.height or d.height)
+
+
+def _run_profile(args: argparse.Namespace, profile: str, verify: bool, err: Printer) -> dict:
+    """Benchmark one profile (and optionally the functional matrix) in this process."""
+    from src import benchmark
+
+    profile_args = argparse.Namespace(**{**vars(args), "optimization": profile})
+    size = _bench_size(args)
+    alt = None if size is None else (size[0] + 64, size[1])  # a different, non-square shape
+    out: dict[str, Any] = {"profile": profile}
+    out["environment"] = [
+        dataclasses.astuple(c)[:2]
+        for c in collect_diagnostics(mock=args.mock, model=args.model, family=args.model_family)
+    ]
+    backend = build_backend(profile_args, err)
+    common = dict(steps=args.steps, size=size, alt_size=alt, log=err)
+    try:
+        if not args.no_perf:
+            out["perf"] = benchmark.benchmark_profile(
+                backend,
+                args.model_family,
+                args.output_dir / profile,
+                profile=profile,
+                **common,
+            )
+        if verify:
+            if args.no_perf:
+                backend.load()
+                backend.warmup()
+            checks = benchmark.functional_checks(
+                backend, args.model_family, args.output_dir / "functional", **common
+            )
+            out["checks"] = [
+                {
+                    "name": c.name,
+                    "ok": c.ok,
+                    "detail": c.detail,
+                    "images": [str(p) for p in c.images],
+                }
+                for c in checks
+            ]
+    except Exception as exc:  # noqa: BLE001 — a crashed profile is a result, not a crash
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _run_profile_subprocess(
+    args: argparse.Namespace, argv: Sequence[str], profile: str, verify: bool, err: Printer
+) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        child_json = Path(tmp) / "result.json"
+        cmd = [
+            sys.executable, "-m", "src.cli", "benchmark", *argv,
+            "--profiles", profile, "--child-json", str(child_json),
+        ]  # fmt: skip
+        if not verify:
+            cmd.append("--no-functional")
+        err(f"benchmark: starting {profile} in a fresh process")
+        code = subprocess.run(cmd).returncode
+        if child_json.is_file():
+            return json.loads(child_json.read_text())
+        return {"profile": profile, "error": f"process exited with code {code}"}
+
+
+def _strip_profile_args(argv: Sequence[str]) -> list[str]:
+    """argv without --profiles/--verify-profile/--report/--in-process (re-added per child)."""
+    out, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg in ("--profiles", "--verify-profile", "--report"):
+            skip = True
+            continue
+        if arg.split("=")[0] in ("--profiles", "--verify-profile", "--report"):
+            continue
+        if arg in ("--in-process", "benchmark"):
+            continue
+        out.append(arg)
+    return out
+
+
+def cmd_benchmark(args: argparse.Namespace, out: Printer, err: Printer) -> int:
+    from src import benchmark
+
+    profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
+    unknown = [p for p in profiles if p not in OPTIMIZATION_PROFILES]
+    if unknown or not profiles:
+        raise UsageError(f"unknown profile(s): {', '.join(unknown) or '(none)'}")
+    if not args.mock:
+        check_model_path(args.model)
+    verify_profile = args.verify_profile or profiles[0]
+    run_functional = not args.no_functional
+
+    if args.child_json:  # internal: one profile, results as JSON for the parent
+        result = _run_profile(args, profiles[0], run_functional, err)
+        args.child_json.write_text(json.dumps(result))
+        return EXIT_OK
+
+    results = []
+    child_argv = _strip_profile_args(args.raw_argv)
+    for profile in profiles:
+        verify = run_functional and profile == verify_profile
+        if args.in_process or len(profiles) == 1:
+            results.append(_run_profile(args, profile, verify, err))
+        else:
+            results.append(_run_profile_subprocess(args, child_argv, profile, verify, err))
+
+    perf = {}
+    for r in results:
+        if "perf" in r:
+            perf[r["profile"]] = r["perf"]
+        elif not args.no_perf:
+            perf[r["profile"]] = {"error": r.get("error", "no result")}
+    checks = None
+    for r in results:
+        if "checks" in r:
+            checks = [
+                benchmark.Check(c["name"], c["ok"], c["detail"], [Path(p) for p in c["images"]])
+                for c in r["checks"]
+            ]
+        elif r["profile"] == verify_profile and run_functional and "error" in r:
+            checks = [benchmark.Check("functional checks", False, r["error"])]
+    sheet = None
+    if checks:
+        sheet = benchmark.contact_sheet(checks, args.output_dir / "functional_contact_sheet.png")
+    environment = next((r["environment"] for r in results if r.get("environment")), [])
+    name = args.model.name if args.model else "mock.safetensors"
+    report = benchmark.render_report(
+        family=args.model_family,
+        model_name=name,
+        environment=[tuple(row) for row in environment],
+        profiles=perf,
+        checks=checks,
+        sheet=sheet,
+    )
+    report_path = args.report or Path("compat") / benchmark.default_report_name(args.model_family)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report)
+    report_path.with_suffix(".json").write_text(json.dumps(results, indent=2))
+    out(str(report_path))
+    err(report)
+    failed_checks = checks is not None and not all(c.ok for c in checks)
+    no_perf = not args.no_perf and not any("error" not in r for r in perf.values())
+    return EXIT_FAILURE if failed_checks or no_perf else EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -464,14 +652,21 @@ def cmd_doctor(args: argparse.Namespace, out: Printer, err: Printer) -> int:
 # Entry point
 # ---------------------------------------------------------------------------
 
-COMMANDS = {"doctor": cmd_doctor, "generate": cmd_generate, "serve": cmd_serve}
+COMMANDS = {
+    "doctor": cmd_doctor,
+    "generate": cmd_generate,
+    "benchmark": cmd_benchmark,
+    "serve": cmd_serve,
+}
 
 
 def main(
     argv: Sequence[str] | None = None, out: Printer = print, err: Printer | None = None
 ) -> int:
     err = err or (lambda message: print(message, file=sys.stderr))
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
+    args.raw_argv = argv
     try:
         return COMMANDS[args.command](args, out, err)
     except (UsageError, ValidationError) as exc:
