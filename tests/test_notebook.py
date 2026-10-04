@@ -23,7 +23,7 @@ CELLS = ["".join(c["source"]) for c in json.loads(NOTEBOOK.read_text())["cells"]
 
 
 def test_notebook_is_minimal_plain_python():
-    assert len(CELLS) == 4
+    assert len(CELLS) == 5  # 4 required cells + the optional new-tab link
     for src in CELLS:
         ast.parse(src)
         assert not re.search(r"^\s*[!%]", src, re.MULTILINE)  # no IPython magics

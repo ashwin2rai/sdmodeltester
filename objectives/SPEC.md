@@ -180,7 +180,7 @@ everywhere without torch.
 ## 12. Colab notebook
 
 **(owner)** A minimal, shareable orchestrator — it clones this public repo and never contains a
-second implementation of anything. Four form cells, plain Python, no magics:
+second implementation of anything. Four form cells (+ one optional), plain Python, no magics:
 1. **Settings** — `MODEL_FAMILY`, `MODEL_URL`, optional `HF_TOKEN` / `CIVITAI_TOKEN`, `PORT`.
 2. **Install** — clone to `/content/sdmodeltester` (or `git pull` when rerun), install both
    requirement files on top of Colab's torch, run `doctor` (stop on failure).
@@ -191,6 +191,11 @@ second implementation of anything. Four form cells, plain Python, no magics:
    printed, and errors never echo URLs.
 4. **Start the UI** — `serve` in the background, UI embedded with
    `serve_kernel_port_as_iframe`; rerunning restarts it.
+5. **(owner) Optional: UI in its own tab** — prints the `google.colab.kernel.proxyPort` link,
+   with its limitations stated in markdown (notebook must stay open; same browser/account; not
+   shareable; needs third-party cookies for `[*.]colab.dev`; Colab may change it).
+
+Both views need third-party cookies allowed for Colab's proxy domains; the intro says so.
 
 **(owner)** The notebook is quiet and "deaf" to the UI: one ✓ line per cell, details only on
 failure, no prompts or server log (that goes to `server.log`; the UI shows progress and errors).
