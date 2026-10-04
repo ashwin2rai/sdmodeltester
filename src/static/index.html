@@ -97,8 +97,6 @@
   input:disabled { opacity: 0.45; }
   textarea { resize: vertical; min-height: 4.5em; font-family: inherit; }
   ::placeholder { color: #5b5b66; }
-  .syntax-hint { margin: 8px 0 0; font-size: 0.76rem; color: var(--muted); }
-  .syntax-hint code { color: var(--text); }
 
   .select-wrap { position: relative; }
   .select-wrap select { padding-right: 30px; }
@@ -249,7 +247,6 @@
       <span class="hint"><span id="prompt-count">0</span> / <span class="max-chars">4000</span></span>
     </div>
     <textarea id="prompt" maxlength="4000" spellcheck="false" autocomplete="off" placeholder="a man with {white | black} hair, (portrait photo:1.2)"></textarea>
-    <p class="syntax-hint"><code>{a | b}</code> picks one per image &middot; <code>(word:1.2)</code> sets a weight</p>
   </section>
 
   <section>
@@ -345,6 +342,9 @@
       <div class="select-wrap">
         <select id="output-select"><option value="">Select any previous output&hellip;</option></select>
         <span class="chevron">&#9662;</span>
+      </div>
+      <div class="viewer" id="output-preview" style="margin-top: 10px;" hidden>
+        <a id="output-preview-link" target="_blank" rel="noopener"><img id="output-preview-image" alt="Selected previous output"></a>
       </div>
       <button class="btn" id="reuse-btn" type="button" style="margin-top: 10px; width: 100%;" disabled>Use selected output as input image</button>
       <div class="field-error" id="reuse-error"></div>
@@ -593,6 +593,13 @@ function syncRecentSelection() {
     btn.classList.toggle('selected', btn.dataset.name === value);
   }
   $('reuse-btn').disabled = !value;
+  $('output-preview').hidden = !value;  // full-size preview of the selected output
+  if (value) {
+    $('output-preview-image').src = outputUrl(value);
+    $('output-preview-link').href = outputUrl(value);
+  } else {
+    $('output-preview-image').removeAttribute('src');
+  }
 }
 
 // --- status polling -------------------------------------------------------------------

@@ -115,6 +115,7 @@ def test_defaults_and_header_from_config(page, live):
     assert page.input_value("#image-select") == ""
     assert page.is_disabled("#strength")
     assert text(page, "#image-hint") == "Text-to-image"
+    assert "{a | b}" not in page.content()  # no syntax hint under the prompt
     assert page.errors == []
 
 
@@ -212,9 +213,20 @@ def test_previous_outputs_and_reuse(page, live):
     page.wait_for_function("document.querySelectorAll('#recent button').length === 5")
     assert page.locator("#output-select option").count() == 9  # placeholder + 8 files
     assert page.is_disabled("#reuse-btn")
+    assert page.is_hidden("#output-preview")  # nothing selected yet
     newest = page.get_attribute("#recent button:nth-child(1)", "title")
     page.click("#recent button:nth-child(1)")
     assert page.input_value("#output-select") == newest
+    assert page.is_visible("#output-preview")
+    assert page.get_attribute("#output-preview-image", "src").endswith(newest)
+    oldest = page.locator("#output-select option").nth(8).get_attribute("value")
+    page.select_option("#output-select", oldest)  # dropdown choice also previews
+    assert page.get_attribute("#output-preview-image", "src").endswith(oldest)
+    assert page.get_attribute("#output-preview-link", "href").endswith(oldest)
+    page.wait_for_function("document.getElementById('output-preview-image').naturalWidth > 0")
+    page.select_option("#output-select", "")
+    assert page.is_hidden("#output-preview")
+    page.click("#recent button:nth-child(1)")
     page.click("#reuse-btn")
     page.wait_for_function(f"document.getElementById('image-select').value === {newest!r}")
     assert "image-to-image" in text(page, "#image-hint")
