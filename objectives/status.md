@@ -33,6 +33,11 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   transformers bounds in `requirements-inference.txt`); also jax 0.11.1, numba 0.61.2,
   pandas 2.2.3. The torch version wasn't listed; `doctor` / Phase 8 must record it.
 - Setup: `uv sync` then `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`.
+  Everything incl. optional groups: `uv run --all-groups pytest` (~45 s, 223 tests at Phase 6).
+- **Optional UI test stack**: `ui` group = playwright (1.63). Chromium headless shell in
+  `~/.cache/ms-playwright` (~270 MB) via `playwright install chromium --only-shell`; the
+  Codespace needed system libs once: `sudo .venv/bin/playwright install-deps
+  chromium-headless-shell` (sudo works without a password here).
 - **Optional CPU inference stack**: `uv run --group inference-cpu pytest` (torch 2.14.1+cpu,
   diffusers 0.40.0, transformers 5.18.0 at time of writing). torch comes from the
   `pytorch-cpu` index (`[tool.uv.sources]`), *never* PyPI's CUDA build. uv syncs exactly,
@@ -57,8 +62,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 2 | Mock backend + shared MicroBatcher (OOM fallback) | committed |
 | 3 | Real Diffusers backend + weighted prompts; CPU tiny-model tests | committed; Colab-only parts pending Phase 8 |
 | 4 | CLI: doctor / generate / serve | committed |
-| 5 | Queue + HTTP API | **done — awaiting owner review/commit** (`index.html` is a placeholder until Phase 6) |
-| 6 | UI (`src/static/index.html`) | not started |
+| 5 | Queue + HTTP API | committed |
+| 6 | UI (`src/static/index.html`) + headless-browser tests | **done — awaiting owner review/commit** |
 | 7 | Local/mock verification | not started |
 | 8 | L4 tuning + `compat/known-good-colab.md` | needs Colab |
 | 9 | Colab notebook | needs Colab, last |
@@ -89,12 +94,13 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `collect_diagnostics(mock, model, family, compile_check) -> list[Check]`, `format_checks`,
   `cmd_doctor` / `cmd_generate` / `cmd_serve`, `UsageError`. `serve` calls
   `src.server.serve(backend, host, port, inputs_dir, outputs_dir)`; Phase 5 must provide it.
+- `src/static/index.html` (Phase 6): the whole UI, inline CSS/JS, no build step.
 - `src/server.py` (Phase 5): `ServerState(backend, inputs_dir, outputs_dir, max_queue, echo)`
   with `start/stop/enqueue/clear_queue/status/log/log_since/is_busy`; `JobRecord`;
   `create_app(state)`; `serve(backend, host, port, inputs_dir, outputs_dir)`;
   `request_from_json`, `list_files`, `safe_child`, `secure_delete`, `clear_directory`,
   `format_seeds`; `MAX_QUEUE = 5`. `src/static/index.html` is a placeholder.
-- Tests: `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
+- Tests: `test_ui.py` (ui marker; Playwright), `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
   `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
   `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
   (1 module skipped); 210 pass with `--group inference-cpu` in ~18 s.
@@ -263,6 +269,41 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 - **Phase 6 notes**: the UI should use relative URLs (`api/status`, not `/api/status`) so
   it works behind path-prefixed proxies.
 
+### Phase 6 decisions (UI)
+
+- Based on the reference `videomodeltests/web/static/index.html` (cloned to the scratchpad
+  for reading only, not vendored): same palette, 520px card, pill, sections, details
+  panels, danger zone, `api()` helper, dropdowns that keep their selection, refresh only
+  when the folder mtime changes.
+- Differences from the reference: **relative URLs** (`api/status`, `outputs/<name>`) for
+  proxies; input defaults to **None (text-to-image)**, and the choice is remembered in
+  `sessionStorage` (`sdmodeltester.input`) and restored if the file still exists. The log
+  comes from the **server** (`log_after` seq) and the client adds only its own errors and
+  offline/reconnect lines. Capped at 100 lines. Polling is a `setTimeout` chain (no overlap).
+- Pill: Loading/Optimizing/Warming (amber pulse), Ready (green), Generating (blue pulse),
+  Error/Offline (red). Progress area: running → "Job N: Batch 1/2 · denoising 14/25" + %,
+  waiting/loading → backend message + indeterminate bar, error → backend_error, idle → "Idle".
+- Viewer: one large image (`object-fit: contain`, max-height 70vh) wrapped in a link that
+  opens the raw PNG in a new tab, plus an "Open PNG" link. Meta "Image i/N · seed S" and
+  that image's resolved prompt. Horizontal 64px thumbnail strip; the first image is
+  selected automatically when a new job completes (detected by `latest_completed_job.id` changing).
+- Previous outputs: 5 newest thumbnails in a 5-column grid, a dropdown of all outputs,
+  clicking a thumbnail selects it in the dropdown, and the button calls `api/reuse-output`
+  and auto-selects the new input.
+- Form: an empty number field sends `null` (server uses the default); strength is disabled
+  for text-to-image; Generate stays enabled while loading; label "Generate N images";
+  randomize seed uses `crypto.getRandomValues` (0..2³²−1). Prompt max 4000 chars (matches
+  the backend).
+- Global `[hidden] { display: none !important }` — needed because `.viewer a { display: block }`
+  overrode the hidden attribute (found from a screenshot).
+- **UI tests** (`tests/test_ui.py`) run a real werkzeug server (`make_server`, port 0) with
+  `ServerState` + mock/Gated backend, and use headless Chromium. They cover: config defaults, labels,
+  seed, queueing while loading, 10-image strip, img2img upload + session persistence,
+  upload/validation errors, previous outputs + reuse, clear queue / clear-all (409, dismiss,
+  accept), XSS (prompt rendered as text), offline/reconnect (route abort), backend error,
+  no horizontal overflow at 360px. 3 repeat runs passed; an innerHTML bug is caught.
+- Exploration/screenshot scripts live in the scratchpad (not the repo).
+
 ### Needs Colab (Phase 8) — cannot be verified locally
 
 - `from_single_file` on real SD1.5/SDXL checkpoints (and Hub config fetch) in fp16 on CUDA.
@@ -274,6 +315,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 
 ## Open questions / TODO
 - SPEC/COLAB_COMPATIBILITY still reference Python 3.12 — consider updating docs.
+- Colab proxy check (Phase 9): confirm relative URLs and "open PNG in new tab" work through
+  `serve_kernel_port_as_iframe`.
 
 ## Learnings
 

@@ -15,6 +15,9 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
 ]
+ui = [
+    "playwright",
+]
 inference-cpu = [
     "torch",
     "diffusers",
@@ -34,6 +37,7 @@ filterwarnings = [
 ]
 markers = [
     "gpu: requires CUDA, torch, diffusers and a real checkpoint (excluded by default)",
+    "ui: browser tests in headless Chromium (skipped unless the ui group + browser are installed)",
     "torch: real backend on CPU with tiny random models (skipped unless the inference-cpu group is installed)",
 ]
 

@@ -30,14 +30,22 @@ uv run ruff check . && uv run ruff format --check .
 
 The normal test suite never needs torch, diffusers, CUDA, or a model download.
 
-Optionally, the real Diffusers backend can be exercised on CPU with tiny random SD1.5/SDXL
-pipelines built from configs (no checkpoint or network; CPU-only torch, ~190 MB):
+Two optional test layers (each skipped automatically when not installed):
 
 ```bash
-uv run --group inference-cpu pytest     # adds tests/test_diffusers_cpu.py (~15 s)
+# Real Diffusers backend on CPU with tiny random SD1.5/SDXL pipelines built from configs
+# (no checkpoint, no network; CPU-only torch ~190 MB).
+uv run --group inference-cpu pytest
+
+# Browser tests of the UI in headless Chromium (one-time browser install).
+uv run --group ui playwright install chromium --only-shell
+sudo "$(pwd)/.venv/bin/playwright" install-deps chromium-headless-shell   # system libs, once
+uv run --group ui pytest tests/test_ui.py
+
+uv run --all-groups pytest      # everything (~45 s)
 ```
 
-Note: a plain `uv sync` / `uv run` removes the optional group again (uv syncs exactly).
+Note: a plain `uv sync` / `uv run` removes optional groups again (uv syncs exactly).
 `requirements.txt` / `requirements-inference.txt` remain for the Colab notebook, which
 installs on top of Colab's own Python and PyTorch.
 
@@ -50,7 +58,7 @@ uv run python -m src.cli generate --mock --model-family sd15 --prompt "a {white 
     --seed 123 --images 4 --output-dir outputs
 uv run python -m src.cli generate --model-family sdxl --model models/x.safetensors \
     --prompt "portrait, (white hair:1.2)" --image inputs/src.png --strength 0.6
-uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # then open :8000
+uv run python -m src.cli serve --mock --model-family sdxl --port 8000    # open http://127.0.0.1:8000
 ```
 
 Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength`) use the
