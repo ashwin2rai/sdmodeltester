@@ -1,0 +1,5 @@
+# Local / mock application dependencies.
+# Must stay free of torch, diffusers, CUDA extensions and model downloads.
+# See objectives/COLAB_COMPATIBILITY.md §2.
+flask>=3.0
+pillow>=10.0

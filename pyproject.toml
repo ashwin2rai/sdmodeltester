@@ -1,0 +1,33 @@
+[project]
+name = "sdmodeltester"
+version = "0.1.0"
+description = "Minimal browser UI for testing SD 1.5 / SDXL single-file checkpoints on a Colab L4"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0",
+    "pillow>=10.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra -m 'not gpu'"
+markers = [
+    "gpu: requires CUDA, torch, diffusers and a real checkpoint (excluded by default)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["objectives", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

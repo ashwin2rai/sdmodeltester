@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- sdmodeltester runtime data (never commit checkpoints or generated images) ---
+models/*
+!models/.gitkeep
+inputs/*
+!inputs/.gitkeep
+outputs/*
+!outputs/.gitkeep
+*.safetensors
+*.ckpt

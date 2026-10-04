@@ -1,0 +1,11 @@
+# Real inference adapter dependencies (Colab / GPU only).
+#
+# Do NOT list torch here: Colab owns Python, CUDA and PyTorch.
+# Version bounds are provisional until Phase 8 L4 verification;
+# see objectives/COLAB_COMPATIBILITY.md §2-3.
+diffusers
+transformers
+accelerate
+safetensors
+huggingface_hub
+# weighted-prompt adapter dependency: selected during Phase 3 (isolated behind src/prompting.py)
