@@ -340,7 +340,7 @@ def resolve_job(
 
 
 def describe_request(job: ResolvedGenerationJob) -> list[str]:
-    """Human-readable job summary for logs: settings, then per-image prompts if dynamic."""
+    """Job summary: a settings line (no prompt text), then per-image prompts if dynamic."""
     req = job.request
     strength = f" · strength {req.strength}" if req.input_image else ""
     lines = [
@@ -616,13 +616,15 @@ class MockBackend(_BatchedBackend):
     def _draw(
         self, spec: ResolvedImageSpec, req: GenerationRequest, source: Image.Image | None
     ) -> Image.Image:
-        color = tuple(random.Random(spec.seed).randrange(40, 216) for _ in range(3))
+        # Colour depends on seed + prompts, but no prompt text is ever drawn (privacy).
+        rng = random.Random(f"{spec.seed}|{spec.prompt}|{spec.negative_prompt}")
+        color = tuple(rng.randrange(40, 216) for _ in range(3))
         if source is None:
             image = Image.new("RGB", (req.width, req.height), color)
         else:
             image = Image.blend(source, Image.new("RGB", source.size, color), req.strength * 0.6)
         # No batch index: like the real backend, an image depends only on seed/prompt/mode.
-        text = f"MOCK {self.family.upper()} · {req.mode}\nseed {spec.seed}\n{spec.prompt[:60]}"
+        text = f"MOCK {self.family.upper()} · {req.mode}\nseed {spec.seed}"
         font = ImageFont.load_default(size=max(12, req.width // 24))
         ImageDraw.Draw(image).multiline_text(
             (16, 16), text, fill="white", font=font, spacing=6, stroke_width=2, stroke_fill="black"

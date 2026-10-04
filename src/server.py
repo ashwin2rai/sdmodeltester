@@ -120,11 +120,13 @@ class ServerState:
 
     # -- logging ---------------------------------------------------------------
 
-    def log(self, text: str) -> None:
+    def log(self, text: str, *, private: bool = False) -> None:
+        """Add a line to the in-memory UI log. ``private`` lines (anything containing prompt
+        text) are never printed, so they can't reach a terminal or log file."""
         with self.lock:
             self._log_seq += 1
             self._log.append((self._log_seq, text))
-        if self.echo:
+        if self.echo and not private:
             print(f"[{datetime.now():%H:%M:%S}] {text}", flush=True)
 
     def log_since(self, after: int) -> list[dict[str, Any]]:
@@ -246,8 +248,10 @@ class ServerState:
             return
         with self.lock:
             record.status, record.message = "running", "Starting…"
-        for line in describe_request(record.job):
-            self.log(f"Job {record.id}: {line}")
+        settings, *prompts = describe_request(record.job)
+        self.log(f"Job {record.id}: {settings}")
+        for line in prompts:
+            self.log(f"Job {record.id}: {line}", private=True)
 
         def progress(fraction: float, message: str) -> None:
             with self.lock:

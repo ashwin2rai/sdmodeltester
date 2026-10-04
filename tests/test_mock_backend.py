@@ -267,3 +267,12 @@ def test_microbatcher_reraises_non_oom_and_size_one_oom():
 
     with pytest.raises(MockOutOfMemory):
         batcher.run(("k", 1, 1), [1, 2, 3, 4], always_oom, lambda e: True)
+
+
+def test_mock_images_vary_by_prompt_without_drawing_it(backend, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _, a = run(backend, tmp_path / "a", seed=1, prompt="a red fox")
+    _, b = run(backend, tmp_path / "b", seed=1, prompt="a blue fox")
+    with Image.open(a.output_paths[0]) as x, Image.open(b.output_paths[0]) as y:
+        assert x.tobytes() != y.tobytes()

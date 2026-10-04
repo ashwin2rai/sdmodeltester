@@ -292,4 +292,3 @@ def test_huggingface_errors_are_short_with_token_hint(monkeypatch, tmp_path):
     with pytest.raises(cu.DownloadError, match="set HF_TOKEN") as info:
         cu.fetch_checkpoint("https://huggingface.co/o/r/blob/main/m.safetensors", tmp_path)
     assert info.value.__cause__ is None and "long library message" not in str(info.value)
-

@@ -521,3 +521,28 @@ def test_clear_all_skips_hidden_files(env):
     (state.inputs_dir / "a.png").write_bytes(png_bytes())
     assert client.delete("/api/clear-all").get_json() == {"deleted": 1}
     assert in_progress.exists()
+
+
+def test_prompts_never_reach_printed_logs(tmp_path, capsys):
+    backend = GatedBackend()
+    backend.load_gate.set()
+    state = ServerState(backend, tmp_path / "i", tmp_path / "o", echo=True)
+    client = create_app(state).test_client()
+    state.start()
+    try:
+        queue(client, prompt="a {zebracorn | glimmerwolf} portrait", num_images=2)
+        wait_until(lambda: state.latest_completed is not None)
+    finally:
+        state.stop()
+    printed = capsys.readouterr().out
+    assert "Job 1: txt2img" in printed  # settings are still logged
+    assert "zebracorn" not in printed and "glimmerwolf" not in printed
+    ui_log = " ".join(entry["text"] for entry in state.log_since(0))
+    assert "zebracorn" in ui_log or "glimmerwolf" in ui_log  # the UI still shows them
+
+
+def test_prompt_boxes_disable_spellcheck(env):
+    _, client, _ = env
+    html = client.get("/").get_data(as_text=True)
+    for box in ('id="prompt"', 'id="negative-prompt"'):
+        assert f'<textarea {box} maxlength="4000" spellcheck="false"' in html
