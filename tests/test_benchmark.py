@@ -131,3 +131,17 @@ def test_cli_benchmark_load_failure_is_reported(tmp_path, monkeypatch):
 def test_cli_benchmark_rejects_unknown_profiles(profiles):
     code, _, err = run_cli("--profiles", profiles)
     assert code == 2 and "unknown profile" in err[-1]
+
+
+def test_functional_crash_keeps_profile_timings(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def crash(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(benchmark, "functional_checks", crash)
+    code, out, _ = run_cli("--profiles", "baseline")
+    report = (tmp_path / out[0]).read_text()
+    assert code == 1
+    assert "| cold load (s) | error |" not in report  # timings survived
+    assert "| functional checks | **FAIL** | OSError: disk full |" in report

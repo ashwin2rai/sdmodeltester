@@ -74,6 +74,8 @@ def install_requirements(repo_dir: Path) -> None:
 def fetch_checkpoint(url: str, models_dir: Path, *, hf_token: str = "", civitai_token: str = ""):
     """Hugging Face file link, Civitai version link, or direct URL -> validated checkpoint."""
     url = url.strip()
+    if url and "://" not in url:
+        url = "https://" + url  # pasted without the scheme
     host = urlparse(url).hostname or ""
     if host in ("huggingface.co", "hf.co"):
         path = _hf_download(url, models_dir, hf_token)
@@ -94,30 +96,37 @@ def _hf_download(url: str, models_dir: Path, token: str) -> Path:
         raise DownloadError("Hugging Face link must point at a .safetensors file")
     from huggingface_hub import hf_hub_download
 
-    return Path(hf_hub_download(
-        repo_id=f"{parts[0]}/{parts[1]}", revision=parts[3], filename="/".join(parts[4:]),
-        token=token or None, local_dir=models_dir,
-    ))  # fmt: skip
+    try:
+        return Path(hf_hub_download(
+            repo_id=f"{parts[0]}/{parts[1]}", revision=parts[3], filename="/".join(parts[4:]),
+            token=token or None, local_dir=models_dir,
+        ))  # fmt: skip
+    except Exception as exc:  # noqa: BLE001 — gated/missing repo, auth, network
+        hint = " (gated or private: set HF_TOKEN and accept the license)" if (
+            "401" in str(exc) or "403" in str(exc) or "Gated" in type(exc).__name__
+        ) else ""  # fmt: skip
+        raise DownloadError(f"Hugging Face download failed: {type(exc).__name__}{hint}") from None
 
 
 def civitai_download_url(url: str, token: str = "") -> str:
     """Model page ``…/models/1?modelVersionId=2`` or ``…/api/download/models/2`` -> download
-    URL, with the API token as ``?token=`` (Civitai's documented download form)."""
+    URL, with the API token as ``?token=`` (Civitai's documented download form). A token
+    already in the pasted link is kept unless another one is given."""
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     if "/api/download/models/" in parsed.path:
         base = parsed._replace(query="").geturl()
     elif "modelVersionId" in query:
-        base = f"https://civitai.com/api/download/models/{query.pop('modelVersionId')[0]}"
-        query = {"type": ["Model"], "format": ["SafeTensor"]}
+        base = f"https://civitai.com/api/download/models/{query['modelVersionId'][0]}"
+        query = {"type": ["Model"], "format": ["SafeTensor"], "token": query.get("token", [])}
     else:
         raise DownloadError(
             "Civitai link must include the version: open the model page, pick the version, "
             "and copy the URL with ?modelVersionId=… (or the version's download link)"
         )
-    query.pop("token", None)
     if token:
         query["token"] = [token]
+    query = {k: v for k, v in query.items() if v}
     return f"{base}?{urlencode(query, doseq=True)}" if query else base
 
 
@@ -127,35 +136,31 @@ def download(url: str, dest_dir: Path) -> Path:
     import requests
 
     try:
-        return _download(requests, url, Path(dest_dir))
+        with requests.get(url, stream=True, timeout=60) as response:
+            if response.status_code in (401, 403):
+                raise DownloadError(f"access denied (HTTP {response.status_code}): this model "
+                                    "needs a token (CIVITAI_TOKEN / HF_TOKEN)")  # fmt: skip
+            if response.status_code >= 400:
+                raise DownloadError(f"download failed (HTTP {response.status_code})")
+            if response.headers.get("Content-Type", "").startswith("text/html"):
+                raise DownloadError("the link returned a web page, not a file")
+            final = Path(dest_dir) / _filename(response)
+            total = int(response.headers.get("Content-Length") or 0)
+            if final.is_file() and final.stat().st_size == total:
+                return final
+            final.parent.mkdir(parents=True, exist_ok=True)
+            part = final.with_name(final.name + ".part")
+            done, shown = 0, 0.0
+            with open(part, "wb") as fh:
+                for chunk in response.iter_content(8 * 2**20):
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if time.monotonic() - shown > 2:  # one updating progress line
+                        shown = time.monotonic()
+                        print(f"\r{final.name}: {done / 2**30:.2f}/{total / 2**30:.2f} GiB",
+                              end="", flush=True)  # fmt: skip
     except requests.RequestException as exc:
         raise DownloadError(f"download failed ({type(exc).__name__}); try again") from None
-
-
-def _download(requests, url: str, dest_dir: Path) -> Path:
-    with requests.get(url, stream=True, timeout=60) as response:
-        if response.status_code in (401, 403):
-            raise DownloadError(f"access denied (HTTP {response.status_code}): this model needs "
-                                "a token (CIVITAI_TOKEN / HF_TOKEN)")  # fmt: skip
-        if response.status_code >= 400:
-            raise DownloadError(f"download failed (HTTP {response.status_code})")
-        if response.headers.get("Content-Type", "").startswith("text/html"):
-            raise DownloadError("the link returned a web page, not a file")
-        final = dest_dir / _filename(response)
-        total = int(response.headers.get("Content-Length") or 0)
-        if final.is_file() and final.stat().st_size == total:
-            return final
-        final.parent.mkdir(parents=True, exist_ok=True)
-        part = final.with_name(final.name + ".part")
-        done, shown = 0, 0.0
-        with open(part, "wb") as fh:
-            for chunk in response.iter_content(8 * 2**20):
-                fh.write(chunk)
-                done += len(chunk)
-                if time.monotonic() - shown > 2:  # one updating progress line
-                    shown = time.monotonic()
-                    print(f"\r{final.name}: {done / 2**30:.2f}/{total / 2**30:.2f} GiB",
-                          end="", flush=True)  # fmt: skip
     if total and part.stat().st_size != total:
         raise DownloadError("download incomplete; run the cell again")
     print("\r", end="")

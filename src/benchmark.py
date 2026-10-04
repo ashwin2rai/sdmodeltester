@@ -270,10 +270,10 @@ def functional_checks(
     for name, fn in matrix:
         try:
             ok, detail, images = fn()
+            if black := [p.name for p in images if is_black(p)]:
+                ok, detail = False, f"black image(s): {', '.join(black)}; {detail}"
         except Exception as exc:  # noqa: BLE001 — record and continue
             ok, detail, images = False, f"{type(exc).__name__}: {exc}", ()
-        if black := [p.name for p in images if is_black(p)]:
-            ok, detail = False, f"black image(s): {', '.join(black)}; {detail}"
         checks.append(Check(name, ok, detail, list(images)))
         log(f"verify: {name}: {'ok' if ok else 'FAIL'} {detail}")
     return checks

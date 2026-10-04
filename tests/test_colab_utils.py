@@ -100,6 +100,10 @@ def small_checkpoints(monkeypatch):
          "https://civitai.com/api/download/models/12?type=Model&token=abc"),
         ("https://civitai.com/models/7/cool?modelVersionId=99", "abc",
          "https://civitai.com/api/download/models/99?type=Model&format=SafeTensor&token=abc"),
+        ("https://civitai.com/api/download/models/12?token=mine", "",  # pasted token is kept
+         "https://civitai.com/api/download/models/12?token=mine"),
+        ("https://civitai.com/models/7?modelVersionId=99&token=mine", "",
+         "https://civitai.com/api/download/models/99?type=Model&format=SafeTensor&token=mine"),
     ],
 )  # fmt: skip
 def test_civitai_download_url(url, token, expected):
@@ -265,3 +269,26 @@ def test_server_start_failure_shows_log(tmp_path):
 def test_show_ui_outside_colab(capsys):
     cu.show_ui(8000)
     assert "127.0.0.1:8000" in capsys.readouterr().out
+
+
+def test_urls_without_scheme_are_accepted(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(cu, "download", lambda url, d: seen.append(url) or tmp_path / "x")
+    monkeypatch.setattr(cu, "validate_checkpoint", lambda path: None)
+    cu.fetch_checkpoint("civitai.com/models/1?modelVersionId=2", tmp_path)
+    assert seen == ["https://civitai.com/api/download/models/2?type=Model&format=SafeTensor"]
+
+
+def test_huggingface_errors_are_short_with_token_hint(monkeypatch, tmp_path):
+    hub = pytest.importorskip("huggingface_hub")
+
+    class GatedRepoError(Exception):
+        pass
+
+    def gated(**kwargs):
+        raise GatedRepoError("401 Client Error ... long library message")
+
+    monkeypatch.setattr(hub, "hf_hub_download", gated)
+    with pytest.raises(cu.DownloadError, match="set HF_TOKEN") as info:
+        cu.fetch_checkpoint("https://huggingface.co/o/r/blob/main/m.safetensors", tmp_path)
+    assert info.value.__cause__ is None and "long library message" not in str(info.value)

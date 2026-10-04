@@ -44,7 +44,6 @@ LOG_LINES = 300
 MAX_UPLOAD_BYTES = 50 * 2**20
 INPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 OUTPUT_EXTENSIONS = {".png"}
-PRESERVED_FILES = {".gitkeep"}  # clear-all leaves the repo placeholder in place
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 ACCEPTING_STATES = {"starting", "loading", "optimizing", "warming", "ready"}
@@ -219,12 +218,15 @@ class ServerState:
 
     def _worker(self) -> None:
         while not self.stopping.is_set():
-            try:
-                record = self.queue.get(timeout=0.1)
-            except queue.Empty:
+            with self.lock:  # dequeue and mark current atomically (clear-all checks both)
+                try:
+                    record = self.current = self.queue.get_nowait()
+                except queue.Empty:
+                    record = None
+            if record is None:
+                time.sleep(0.05)
                 continue
             with self.lock:
-                self.current = record
                 if not self.ready.is_set():
                     record.status = "waiting_for_model"
                     record.message = "Waiting for model…"
@@ -357,7 +359,8 @@ def secure_delete(path: Path) -> None:
 def clear_directory(directory: Path) -> int:
     count = 0
     for path in directory.iterdir():
-        if path.name in PRESERVED_FILES or path.is_symlink() or not path.is_file():
+        # Hidden files are skipped: .gitkeep and in-progress uploads (.upload-*.part).
+        if path.name.startswith(".") or path.is_symlink() or not path.is_file():
             continue
         secure_delete(path)
         count += 1
@@ -475,9 +478,12 @@ def create_app(state: ServerState) -> Flask:
         file = request.files.get("file")
         if file is None or not file.filename:
             return _error("no file uploaded (field 'file')", 400)
-        name = secure_filename(file.filename) or "upload.png"
-        if Path(name).suffix.lower() not in INPUT_EXTENSIONS:
-            return _error(f"unsupported file type: {Path(name).suffix or 'none'}", 400)
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in INPUT_EXTENSIONS:
+            return _error(f"unsupported file type: {suffix or 'none'}", 400)
+        name = secure_filename(file.filename)
+        if Path(name).suffix.lower() != suffix:  # e.g. a non-ASCII name stripped to "png"
+            name = f"upload{suffix}"
         # Stream to a hidden temp name (not listed: wrong suffix), verify, then publish.
         tmp = state.inputs_dir / f".upload-{uuid.uuid4().hex}.part"
         file.save(tmp)

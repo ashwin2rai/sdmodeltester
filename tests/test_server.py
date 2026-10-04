@@ -506,3 +506,18 @@ def _reachable(base):
         return True
     except OSError:
         return False
+
+
+def test_non_ascii_upload_names_are_accepted(env):
+    state, client, _ = env
+    response = upload(client, png_bytes(), "画像.png")
+    assert response.status_code == 200 and response.get_json()["filename"] == "upload.png"
+
+
+def test_clear_all_skips_hidden_files(env):
+    state, client, _ = ready_env(env)
+    in_progress = state.inputs_dir / ".upload-abc.part"
+    in_progress.write_bytes(b"partial")
+    (state.inputs_dir / "a.png").write_bytes(png_bytes())
+    assert client.delete("/api/clear-all").get_json() == {"deleted": 1}
+    assert in_progress.exists()

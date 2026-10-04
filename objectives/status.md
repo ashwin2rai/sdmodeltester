@@ -38,6 +38,24 @@ where we are, and what we learned.
 | Run `benchmark` on a real L4 for SD1.5 + SDXL, pick the default profile, write `compat/known-good-colab.md` | needs Colab |
 | Run the notebook on Colab, fix what reality finds, pin `requirements-inference.txt` ranges | needs Colab |
 
+## Verified against Colab without a GPU (2026-10-04)
+
+- Colab's GPU image (`googlecolab/backend-info` `pip-freeze.gpu.txt`, updated 2026-10-02):
+  Python 3.13.15, torch 2.11.0+cu130, diffusers 0.40.0, transformers 5.18.0, accelerate 1.15.0,
+  safetensors 0.8.0, huggingface_hub 1.33.0, Flask 3.1.3, Werkzeug 3.1.9, pillow 11.3.0,
+  numpy 2.1.3 — everything we need is preinstalled.
+- `uv pip install --dry-run -r requirements.txt -r requirements-inference.txt` on top of exactly
+  those versions: **"Would make no changes"** (cell 2 cannot touch torch).
+- Full suite in a venv with those exact versions (torch 2.11.0 CPU build): 251 passed (UI tests
+  skipped there; no playwright).
+- Live endpoints, headers only: HF `stable-diffusion-v1-5/stable-diffusion-v1-5/
+  v1-5-pruned-emaonly.safetensors` (3.97 GiB) and `stabilityai/stable-diffusion-xl-base-1.0/
+  sd_xl_base_1.0.safetensors` (6.46 GiB) exist; Civitai (Juggernaut XL, version 1759168): both
+  the page URL and the download link → one 307 to Cloudflare R2 → 200 octet-stream with
+  Content-Length; our filename logic gives `juggernautXL_ragnarok.safetensors`.
+- To refresh this check later: download `pip-freeze.gpu.txt`, build a venv with those pins
+  (CPU torch from the pytorch-cpu index), dry-run the requirements, run pytest.
+
 ## Still unverified (needs Colab)
 
 - `from_single_file` FP16 on CUDA for both families (Hub config fetch); SDXL FP16 VAE black
@@ -77,6 +95,12 @@ where we are, and what we learned.
   names.
 - `requests` exception messages contain the URL — never let them reach the notebook when a token
   is in the query string.
+- Code review (2026-10-04) found and we fixed: a pasted Civitai `?token=` was dropped; non-ASCII
+  upload names were rejected (`secure_filename` strips them → `upload.<ext>` fallback); the worker
+  dequeued outside the lock (clear-all could race a job — dequeue + `current` now atomic);
+  clear-all could delete an in-progress upload (it now skips hidden files, incl. `.gitkeep`);
+  scheme-less links were rejected; HF errors were raw tracebacks; a functional-check crash wiped
+  a profile's timings; no `empty_cache()` between benchmark profiles.
 - Bugs the tests caught: remainder batch overwrote the OOM limit; server stop waited 15 s
   (zombie); benchmark paths relative to the wrong cwd; CSS overriding `[hidden]`.
 - Mutations the suite catches: shared generator, skipped weighting, stretch instead of crop,

@@ -241,14 +241,21 @@ def cmd_benchmark(args: argparse.Namespace, out: Printer, err: Printer) -> int:
             perf[profile] = benchmark.benchmark_profile(
                 backend, args.model_family, BENCHMARK_DIR / profile, profile=profile, log=err
             )
-            if checks is None and not args.no_functional:
+        except Exception as exc:  # noqa: BLE001 — a crashed profile is a result
+            perf[profile] = {"error": f"{type(exc).__name__}: {exc}"}
+        if checks is None and not args.no_functional and "error" not in perf[profile]:
+            try:
                 checks = benchmark.functional_checks(
                     backend, args.model_family, BENCHMARK_DIR / "functional", log=err
                 )
-        except Exception as exc:  # noqa: BLE001 — a crashed profile is a result
-            perf[profile] = {"error": f"{type(exc).__name__}: {exc}"}
+            except Exception as exc:  # noqa: BLE001 — keep this profile's timings
+                checks = [
+                    benchmark.Check("functional checks", False, f"{type(exc).__name__}: {exc}")
+                ]
         del backend
         gc.collect()  # release the previous pipeline before loading the next one
+        if "torch" in sys.modules:
+            sys.modules["torch"].cuda.empty_cache()
 
     sheet = benchmark.contact_sheet(checks, BENCHMARK_DIR / "functional_contact_sheet.png")
     report = benchmark.render_report(
