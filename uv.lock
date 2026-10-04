@@ -1467,6 +1467,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "requests" },
     { name = "ruff" },
 ]
 inference-cpu = [
@@ -1490,6 +1491,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
+    { name = "requests", specifier = ">=2.31" },
     { name = "ruff", specifier = ">=0.5" },
 ]
 inference-cpu = [

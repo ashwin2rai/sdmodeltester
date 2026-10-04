@@ -33,7 +33,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   transformers bounds in `requirements-inference.txt`); also jax 0.11.1, numba 0.61.2,
   pandas 2.2.3. The torch version wasn't listed; `doctor` / Phase 8 must record it.
 - Setup: `uv sync` then `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`.
-  Everything incl. optional groups: `uv run --all-groups pytest` (~70 s, 247 tests at Phase 8a).
+  Everything incl. optional groups: `uv run --all-groups pytest` (~100 s, 304 tests at Phase 9a;
+  243 pass + 3 modules skipped without optional groups).
 - **Optional UI test stack**: `ui` group = playwright (1.63). Chromium headless shell in
   `~/.cache/ms-playwright` (~270 MB) via `playwright install chromium --only-shell`; the
   Codespace needed system libs once: `sudo .venv/bin/playwright install-deps
@@ -65,9 +66,10 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
 | 5 | Queue + HTTP API | committed |
 | 6 | UI (`src/static/index.html`) + headless-browser tests | committed (owner checked the UI by hand: OK) |
 | 7 | Local/mock verification | effectively done via automated tests (mock, CPU-tiny, browser) |
-| 8a | Phase 8 tooling: `benchmark` CLI (profiles + functional matrix + report) | **done — awaiting owner review/commit** |
+| 8a | Phase 8 tooling: `benchmark` CLI (profiles + functional matrix + report) | committed |
 | 8b | Run the benchmark on a real L4 for SD1.5 + SDXL, pick the default profile, write `compat/known-good-colab.md` | needs Colab |
-| 9 | Colab notebook | needs Colab, last |
+| 9a | Colab notebook draft + `notebooks/colab_utils.py` (downloads, launch), tested locally incl. demo-mode E2E | **done — awaiting owner review/commit** |
+| 9b | Run the notebook on a real Colab L4 (both families), fix whatever reality finds, finalize with 8b results | needs Colab |
 
 ## What exists
 
@@ -95,6 +97,15 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `collect_diagnostics(mock, model, family, compile_check) -> list[Check]`, `format_checks`,
   `cmd_doctor` / `cmd_generate` / `cmd_serve`, `UsageError`. `serve` calls
   `src.server.serve(backend, host, port, inputs_dir, outputs_dir)`; Phase 5 must provide it.
+- `notebooks/colab_utils.py` (Phase 9a): `get_secret`, `classify_source`, `parse_hf_url`,
+  `parse_civitai_url`, `download_url` (.part + Range resume + SHA256), `resolve_civitai`,
+  `pick_civitai_file`, `civitai_family_warning`, `read_safetensors_header`, `guess_family`,
+  `validate_checkpoint`, `fetch_checkpoint`, `runtime_preflight`, `run`, `install_requirements`,
+  `start_server`/`stop_server`/`port_open`/`server_status`/`follow_log`/`tail`, `show_ui`,
+  `run_streaming`, `zip_outputs`.
+- `notebooks/colab.ipynb` (Phase 9a): 9 code cells (1 Settings, 2 Get code + GPU check,
+  3 Install + doctor, 4 Download model, 5 Start server + UI, 6 Log, 7 Zip outputs,
+  8 Benchmark, 9 Stop) + intro markdown.
 - `src/benchmark.py` (Phase 8a): `benchmark_profile(backend, family, out, profile, steps, size,
   alt_size, log)`, `functional_checks(...) -> list[Check]`, `contact_sheet`, `recommend`,
   `render_report`, `is_black`, `max_pixel_diff`, `default_report_name`. CLI: `cmd_benchmark`
@@ -106,7 +117,8 @@ Update it at every pause point. Source-of-truth specs: `SPEC.md`, `COLAB_COMPATI
   `create_app(state)`; `serve(backend, host, port, inputs_dir, outputs_dir)`;
   `request_from_json`, `list_files`, `safe_child`, `secure_delete`, `clear_directory`,
   `format_seeds`; `MAX_QUEUE = 5`. `src/static/index.html` is a placeholder.
-- Tests: `test_benchmark.py`, `test_ui.py` (ui marker; Playwright), `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
+- Tests: `test_colab_utils.py` (local HTTP server fakes HF/Civitai/CDN), `test_notebook.py`
+  (structure + demo-mode E2E), `test_benchmark.py`, `test_ui.py` (ui marker; Playwright), `test_server.py`, `test_cli.py`, `test_package.py`, `test_prompting.py`, `test_seeds.py`, `test_request.py`,
   `test_preprocess.py`, `test_mock_backend.py`, `test_real_backend.py` (no torch), and
   `test_diffusers_cpu.py` (torch marker; skipped without the group). 108 pass without torch
   (1 module skipped); 210 pass with `--group inference-cpu` in ~18 s.
@@ -362,6 +374,64 @@ Reviewed `je4ngomes/fast-stable-diffusion/fast_stable_diffusion_AUTOMATIC1111_py
   `hf_hub_download` for HF URLs (blob/resolve parsing), Civitai model-page →
   `api/download/models/{versionId}` (or the v1 API for the latest version), safetensors header
   validation (8-byte length + JSON) + a warn-only family hint from tensor key names.
+
+### Phase 9a decisions (Colab notebook)
+
+- **Self-contained + shareable** (owner requirement): the notebook only needs the public repo
+  (`https://github.com/ashwin2rai/sdmodeltester`, default branch `main`; confirmed public).
+  Cell 2 clones (or updates in place: `fetch --depth 1 origin REF` + `checkout --force
+  FETCH_HEAD`), puts `notebooks/` on `sys.path`, and imports/reloads `colab_utils as cu`.
+  Settings `REPO_URL` / `REPO_REF` (advanced) allow forks/tags. `WORK_DIR="/content"`.
+- **No IPython magics**: every cell is plain Python (tested with `ast.parse`); all cells are
+  forms (`# @title … { display-mode: "form" }`). Notebook metadata asks for a GPU / L4.
+- **Tokens**: `cu.get_secret(name, form_value)` = Colab Secrets → form field → env. Form
+  fields default to empty; the intro explains Secrets so shared copies never hold tokens.
+  Tokens are never printed; URLs in errors are redacted (`token=`, `signature`, `X-Amz-*`).
+- **Downloads** (`fetch_checkpoint`): local/Drive path | HF (`hf_hub_download(local_dir=…)`;
+  `/blob/` or `/resolve/` URLs; must be .safetensors) | Civitai (model page, `?modelVersionId=`,
+  `/api/download/models/{id}`, `/api/v1/model-versions/{id}`, resolved via API v1; picks the
+  primary SafeTensor *Model* file, not a VAE; verifies SHA256; warns if `model.type` isn't
+  Checkpoint or `baseModel` doesn't match the family (Pony/Illustrious/NoobAI count as sdxl)) |
+  direct URL. Streaming uses `requests` with 8 MiB chunks to `<name>.part`, Range-resumes a
+  partial file, renames only when complete, and prints progress every 10 s (plain lines that
+  work in any log viewer). The Bearer token is in the session header, and requests drops it on
+  a cross-host redirect (tested: API host gets it, CDN host doesn't). HTML responses / 401 /
+  403 / 404 give clear errors.
+- **Validation**: `.safetensors` only, ≥ 500 MiB (else "LoRA or embedding?"), header parsed
+  (8-byte LE length + JSON; HTML/JSON error pages detected), and a warn-only family guess from
+  tensor keys (`conditioner.embedders.1.` = sdxl, `cond_stage_model.transformer.` = sd15,
+  `cond_stage_model.model.` = sd2, lora/diffusers/flux detected).
+- **Install**: `pip install -r requirements.txt -r requirements-inference.txt` via the quiet
+  `run()`; compares the torch version before/after and warns loudly if pip changed it.
+- **Server**: `start_server` stops a previous instance (pid file, own process group via
+  `start_new_session`), refuses if the port is busy, waits for the port, and shows the log tail
+  on failure. `stop_server` reaps the child with `waitpid(WNOHANG)`: a zombie still "exists"
+  for `killpg(pid, 0)`, which made stopping take the full 15 s timeout (bug found by tests).
+  `follow_log` streams `server.log` until `/api/status` says ready/error (or timeout 30 min);
+  cell 5 prints a one-line verdict.
+- **UI**: `show_ui` → `google.colab.output.serve_kernel_port_as_iframe(port, height=1100)`
+  plus a best-effort full-tab link via `eval_js("google.colab.kernel.proxyPort(port)")`.
+- **Drive**: optional `SAVE_MODELS_TO_DRIVE` mounts Drive and keeps models in
+  `MyDrive/sdmodeltester/models` (inputs/outputs stay on the VM).
+- **Demo mode** (`DEMO_MODE`): `--mock` everywhere (doctor, serve, benchmark), no model or GPU
+  needed. Lets people try the UI and lets `test_notebook.py` run the real cells end to end
+  (fake remote = a temporary git repo of the working tree; `install_requirements` stubbed).
+- Cell 8 (benchmark) stops the server first (VRAM), writes `compat/benchmark-<family>.md`,
+  renders it and the contact sheet; the user re-runs cell 5 afterwards.
+- **Editing the notebook**: it was generated by a builder script in the session scratchpad
+  (not kept). To change it, load the JSON and replace a cell's `source` (cells are found by
+  their `# @title N ·` line), then rerun `tests/test_notebook.py`. Ruff lints the notebook
+  (E501 ignored for `*.ipynb`; formatter excludes `*.ipynb`).
+
+### Needs Colab (Phase 9b)
+
+- Does `serve_kernel_port_as_iframe` load the UI, and do relative URLs + "Open PNG" work
+  through the proxy? Does the `proxyPort` full-tab link work?
+- `pip install` on the current Colab image: confirm torch is untouched and diffusers /
+  transformers versions work with Colab's torch; then pin compatible ranges in
+  `requirements-inference.txt` (COLAB_COMPATIBILITY §2).
+- Real HF (gated + public) and Civitai (token-required) downloads; Content-Disposition
+  naming; resume after a disconnect; Drive option.
 
 ### Needs Colab (Phase 8b) — cannot be verified locally
 

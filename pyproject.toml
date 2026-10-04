@@ -13,6 +13,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "requests>=2.31",  # notebooks/colab_utils.py (preinstalled on Colab)
     "ruff>=0.5",
 ]
 ui = [
@@ -48,6 +49,12 @@ extend-exclude = ["objectives", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E501"]  # Colab form `# @markdown` lines are user-facing prose
+
+[tool.ruff.format]
+exclude = ["*.ipynb"]  # generated cell layout; keep Colab form lines as written
 
 # ---------------------------------------------------------------------------
 # uv: optional CPU-only inference stack for local tests of the real backend

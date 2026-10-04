@@ -11,7 +11,8 @@ NVIDIA L4: the checkpoint is loaded once, kept resident on the GPU, and driven r
 ## Layout
 
 ```text
-src/                     application code (backend, prompting, server, CLI, UI)
+src/                     application code (backend, prompting, server, CLI, UI, benchmark)
+notebooks/               Colab notebook + its helper module
 tests/                   test suite — runs without torch/diffusers/GPU
 models/ inputs/ outputs/ runtime data (git-ignored)
 objectives/              spec, Colab compatibility policy, development status
@@ -80,11 +81,26 @@ model family's defaults. `generate` prints output paths on stdout and progress o
 Exit codes: 0 success, 1 runtime/load failure (or `doctor` found a missing required
 capability), 2 invalid arguments or request.
 
-## Real inference (Colab L4)
+## Run on Colab (L4)
 
-`requirements-inference.txt` holds the Diffusers-side dependencies. It intentionally does
-**not** list torch: Colab supplies Python, CUDA, and PyTorch. The Colab notebook is built
-last, after the backend, server and UI are stable — see
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ashwin2rai/sdmodeltester/blob/main/notebooks/colab.ipynb)
+
+`notebooks/colab.ipynb` is self-contained and shareable: it clones this repo, installs only
+the app-level libraries on top of Colab's own Python/CUDA/PyTorch (it never reinstalls
+torch), runs `doctor`, downloads one checkpoint, starts the server, and embeds the UI with
+Colab's built-in kernel proxy (no ngrok/Cloudflare).
+
+- **Model sources**: Hugging Face file links (`hf_hub_download`), Civitai model pages or
+  download links (resolved through the Civitai API, SHA256-verified), direct URLs, or a
+  local/Drive path. Downloads resume after interruptions and must be real `.safetensors`
+  checkpoints; a family mismatch is warned about.
+- **Tokens**: Colab Secrets `HF_TOKEN` / `CIVITAI_TOKEN` are used first, so shared copies
+  of the notebook never contain anyone's token.
+- **Demo mode** runs the whole UI with placeholder images on any runtime (no GPU/model).
+- Cell 8 runs the Phase 8 benchmark and shows the report + contact sheet.
+
+Notebook helpers live in `notebooks/colab_utils.py` (operational code, not part of `src/`).
+`requirements-inference.txt` intentionally does **not** list torch — see
 [`objectives/COLAB_COMPATIBILITY.md`](objectives/COLAB_COMPATIBILITY.md).
 
 ## License
