@@ -22,7 +22,6 @@ from PIL import Image  # noqa: E402
 import src.backend  # noqa: E402
 from src.backend import (  # noqa: E402
     SAMPLER_IDS,
-    SDXL_FP16_VAE,
     DiffusersBackend,
     GenerationError,
     make_scheduler,
@@ -402,65 +401,6 @@ def test_warmup_writes_no_files(tmp_path, monkeypatch):
     backend.load()
     backend.warmup()
     assert list(Path(tmp_path).rglob("*.png")) == []
-
-
-def unet_batch_sizes(backend, monkeypatch):
-    """Record the UNet batch size of every denoising step (CFG doubles it)."""
-    unet = backend.txt2img.unet
-    sizes = []
-    forward = unet.forward
-
-    def spy(sample, *args, **kwargs):
-        sizes.append(sample.shape[0])
-        return forward(sample, *args, **kwargs)
-
-    monkeypatch.setattr(unet, "forward", spy)
-    return sizes
-
-
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    [
-        (dict(steps=8), [4] * 6 + [2] * 2),  # CFG for 75% of steps, then positive only
-        (dict(steps=8, input_image="in.png", strength=0.5), [4] * 3 + [2]),  # 4 real steps
-        (dict(steps=4, guidance_scale=1.0), [2] * 4),  # no CFG at all
-    ],
-)
-def test_cfg_dropped_for_last_steps(loaded, tmp_path, monkeypatch, overrides, expected):
-    fields = {"num_images": 2, "guidance_scale": 6.0} | overrides
-    if "input_image" in fields:
-        Image.new("RGB", (SIZE, SIZE), (90, 120, 30)).save(tmp_path / "in.png")
-        fields["input_image"] = tmp_path / "in.png"
-    sizes = unet_batch_sizes(loaded, monkeypatch)
-    job = resolve_job(tiny_request(**fields))
-    result = loaded.generate(job, tmp_path)
-    assert sizes == expected
-    assert len(result.output_paths) == 2
-
-
-def test_sdxl_fp16_vae_never_upcasts(monkeypatch):
-    calls = []
-
-    def fake_from_pretrained(repo, **kwargs):
-        calls.append((repo, kwargs["torch_dtype"]))
-        return tiny_vae()
-
-    monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", fake_from_pretrained)
-    backend = make_backend("sdxl")
-    vae = backend._sdxl_fp16_vae()
-    assert calls == [(SDXL_FP16_VAE, torch.float16)]
-    assert vae.config.force_upcast is False
-    assert f"Using FP16 VAE {SDXL_FP16_VAE}" in backend.logs
-
-
-def test_sdxl_fp16_vae_failure_keeps_checkpoint_vae(monkeypatch):
-    def offline(repo, **kwargs):
-        raise OSError("no network")
-
-    monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", offline)
-    backend = make_backend("sdxl")
-    assert backend._sdxl_fp16_vae() is None
-    assert any("using the checkpoint's VAE: OSError" in line for line in backend.logs)
 
 
 # ---------------------------------------------------------------------------

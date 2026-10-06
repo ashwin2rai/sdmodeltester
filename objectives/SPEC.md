@@ -53,17 +53,12 @@ generation database, sidecar JSON, prompt metadata in PNGs, family auto-detectio
   CUDA, no CPU offload. Incompatible checkpoints fail with a clear error.
 - SD1.5 safety checker disabled; SDXL invisible watermark disabled (txt2img and img2img).
 - img2img reuses the loaded components (`from_pipe`); no second copy of the weights.
-- **(owner)** SDXL on FP16 uses the FP16-safe VAE `madebyollin/sdxl-vae-fp16-fix` (Hub
-  download, `force_upcast` off) instead of the checkpoint's VAE, so decodes stay in FP16; if it
-  can't load, the checkpoint's VAE is kept and the fallback is logged.
-- **(owner)** CFG runs for the first 75% of denoising steps only (`CFG_STEP_FRACTION`); the
-  rest drop the negative pass (both families, txt2img and img2img). Not a UI knob.
 
 | | SD 1.5 | SDXL |
 |---|---:|---:|
 | size | 512×512 | 1024×1024 |
 | steps / CFG | 25 / 7.5 | 25 / 5.0 |
-| sampler **(owner)** | DPM++ 2M Karras | DPM++ 2M Karras |
+| sampler | DPM++ 2M SDE Karras | DPM++ 2M SDE Karras |
 | seed / images / strength | −1 / 1 / 0.60 | −1 / 1 / 0.60 |
 
 Hidden in V1: clip skip (None), SDXL second prompts (reuse main), SDXL size conditioning

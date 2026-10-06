@@ -84,8 +84,8 @@ class FamilyDefaults:
 
 
 FAMILY_DEFAULTS: dict[str, FamilyDefaults] = {
-    "sd15": FamilyDefaults(512, 512, 25, 7.5, "dpmpp_2m_karras", -1, 1, 0.6),
-    "sdxl": FamilyDefaults(1024, 1024, 25, 5.0, "dpmpp_2m_karras", -1, 1, 0.6),
+    "sd15": FamilyDefaults(512, 512, 25, 7.5, "dpmpp_2m_sde_karras", -1, 1, 0.6),
+    "sdxl": FamilyDefaults(1024, 1024, 25, 5.0, "dpmpp_2m_sde_karras", -1, 1, 0.6),
 }
 
 
@@ -648,26 +648,11 @@ def save_png(image: Image.Image, path: Path) -> None:
 OPTIMIZATION_PROFILES: tuple[str, ...] = ("baseline", "compile", "compile-max")
 DEFAULT_OPTIMIZATION = "baseline"  # until Phase 8 L4 benchmarks pick a winner
 WARMUP_STEPS = 3
-# SDXL VAE re-scaled to run in FP16; the stock one upcasts every decode to FP32.
-SDXL_FP16_VAE = "madebyollin/sdxl-vae-fp16-fix"
-# Classifier-free guidance runs for this share of the denoising steps; the rest skip the
-# negative pass (half the UNet work) with little visible change.
-CFG_STEP_FRACTION = 0.75
-# Embeddings the pipeline concatenates as [negative, positive] while CFG is on.
-CFG_TENSOR_INPUTS = {
-    "sd15": ["prompt_embeds"],
-    "sdxl": ["prompt_embeds", "add_text_embeds", "add_time_ids"],
-}
 
 
 def configure_cuda_allocator() -> None:
     """Set the allocator config; only effective if called before torch is imported."""
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
-
-def cfg_steps(total_steps: int) -> int:
-    """Number of leading denoising steps that use classifier-free guidance."""
-    return max(1, round(total_steps * CFG_STEP_FRACTION))
 
 
 def make_scheduler(sampler: str, base_config: Any) -> Any:
@@ -757,28 +742,10 @@ class DiffusersBackend(_BatchedBackend):
                 requires_safety_checker=False,
             )
         else:
-            vae = self._sdxl_fp16_vae() if self.dtype_name == "float16" else None
             pipe = diffusers.StableDiffusionXLPipeline.from_single_file(
-                str(self.model_path),
-                torch_dtype=dtype,
-                add_watermarker=False,
-                **({"vae": vae} if vae is not None else {}),
+                str(self.model_path), torch_dtype=dtype, add_watermarker=False
             )
         return pipe.to(self.device)
-
-    def _sdxl_fp16_vae(self) -> Any:
-        """The FP16-safe SDXL VAE, or None (keep the checkpoint's VAE) if it can't load."""
-        import diffusers
-        import torch
-
-        try:
-            vae = diffusers.AutoencoderKL.from_pretrained(SDXL_FP16_VAE, torch_dtype=torch.float16)
-        except Exception as exc:  # noqa: BLE001 — optional speed-up, never fatal
-            self.log(f"FP16 VAE unavailable, using the checkpoint's VAE: {type(exc).__name__}")
-            return None
-        vae.register_to_config(force_upcast=False)
-        self.log(f"Using FP16 VAE {SDXL_FP16_VAE}")
-        return vae
 
     def _img2img_from(self, pipe: Any) -> Any:
         """Img2img pipeline sharing the already-loaded components (no second weight copy)."""
@@ -917,12 +884,7 @@ class DiffusersBackend(_BatchedBackend):
         generators = [torch.Generator(device=self.device).manual_seed(s.seed) for s in batch]
 
         def callback(pipeline: Any, step_index: int, _timestep: Any, kwargs: dict) -> dict:
-            total = pipeline.num_timesteps
-            if pipeline.do_classifier_free_guidance and step_index + 1 == cfg_steps(total) < total:
-                # Drop CFG for the remaining steps: keep only the positive halves.
-                pipeline._guidance_scale = 0.0
-                kwargs = {name: kwargs[name].chunk(2)[1] for name in kwargs}
-            on_step(step_index + 1, total)
+            on_step(step_index + 1, pipeline.num_timesteps)
             return kwargs
 
         call_kwargs: dict[str, Any] = dict(
@@ -931,7 +893,6 @@ class DiffusersBackend(_BatchedBackend):
             guidance_scale=req.guidance_scale,
             generator=generators,
             callback_on_step_end=callback,
-            callback_on_step_end_tensor_inputs=CFG_TENSOR_INPUTS[self.family],
             output_type="pil",
         )
         if source is None:

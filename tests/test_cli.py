@@ -49,7 +49,7 @@ def test_request_uses_family_defaults(family, size, cfg):
     )
     req, notes = cli.build_request(args)
     assert (req.width, req.height, req.guidance_scale, req.steps) == (size, size, cfg, 25)
-    assert req.sampler == "dpmpp_2m_karras" and req.seed == -1 and req.num_images == 1
+    assert req.sampler == "dpmpp_2m_sde_karras" and req.seed == -1 and req.num_images == 1
     assert req.input_image is None and req.strength is None and notes == []
 
 
