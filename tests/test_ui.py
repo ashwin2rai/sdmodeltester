@@ -109,7 +109,7 @@ def test_defaults_and_header_from_config(page, live):
     open_ready(page, live)
     assert text(page, "#model-info") == "SDXL · model.safetensors"
     assert page.input_value("#width") == "1024" and page.input_value("#cfg") == "5"
-    assert page.input_value("#sampler") == "dpmpp_2m_sde_karras"
+    assert page.input_value("#sampler") == "dpmpp_2m_karras"
     assert page.locator("#sampler option").count() == 6
     assert page.input_value("#seed") == "-1"
     assert page.input_value("#image-select") == ""

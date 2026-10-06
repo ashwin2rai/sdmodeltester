@@ -81,6 +81,19 @@ where we are, and what we learned.
 - On Colab, run the benchmark from a terminal or scratch cell in `/content/sdmodeltester` after
   stopping the UI server (it needs the VRAM).
 
+## SDXL speed changes (2026-10-06, owner) — unmeasured on L4
+
+- Owner saw ~40 s for SDXL ~1240×1024 at 18–20 steps on the L4; expected ~15–18 s, so check the
+  sampler (Heun/DPM2 = 2 UNet calls per step), image count and per-step time first.
+- Added: FP16-fix SDXL VAE (no FP32 upcast on decode/encode), CFG dropped for the last 25% of
+  steps, default sampler `dpmpp_2m_karras` (converges in fewer steps than the SDE variant).
+  Expected: a few seconds less per SDXL decode plus ~10–15% less denoising. Fixed-seed images
+  differ from before.
+- To verify on Colab: time before/after, check the log says `Using FP16 VAE …`, look for
+  black/NaN images, compare quality with the cutoff (set `CFG_STEP_FRACTION = 1.0` to disable).
+- Next cheap options if needed: native SDXL sizes (~1 MP), distilled (Lightning/DMD2)
+  checkpoints at 4–8 steps with CFG ≤ 2, the `compile` profile.
+
 ## Implementation notes
 
 - Code map: `src/prompting.py` (dynamic + weighted prompts), `src/backend.py` (types, request
