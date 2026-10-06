@@ -4,7 +4,7 @@ Persistent memory for development sessions — read first when resuming, update 
 What the repo must do (incl. all owner decisions) is in `SPEC.md`; this file is how we work,
 where we are, and what we learned.
 
-**Last updated:** 2026-10-04
+**Last updated:** 2026-10-06
 
 ## Working agreement (owner)
 

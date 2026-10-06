@@ -210,22 +210,29 @@ def test_previous_outputs_and_reuse(page, live):
         generate(page, "x", images=4)
         wait_for_job(page, job)
     page.click("#previous-outputs summary")
-    page.wait_for_function("document.querySelectorAll('#recent button').length === 5")
-    assert page.locator("#output-select option").count() == 9  # placeholder + 8 files
+    # every output is in the band, newest first; no filename dropdown
+    page.wait_for_function("document.querySelectorAll('#recent button').length === 8")
+    assert page.locator("#output-select").count() == 0
+    assert page.evaluate(
+        "(() => { const s = document.getElementById('recent');"
+        " return s.scrollWidth > s.clientWidth; })()"
+    )
     assert page.is_disabled("#reuse-btn")
     assert page.is_hidden("#output-preview")  # nothing selected yet
     newest = page.get_attribute("#recent button:nth-child(1)", "title")
     page.click("#recent button:nth-child(1)")
-    assert page.input_value("#output-select") == newest
     assert page.is_visible("#output-preview")
     assert page.get_attribute("#output-preview-image", "src").endswith(newest)
-    oldest = page.locator("#output-select option").nth(8).get_attribute("value")
-    page.select_option("#output-select", oldest)  # dropdown choice also previews
+    oldest = page.get_attribute("#recent button:nth-child(8)", "title")
+    page.click("#recent button:nth-child(8)")  # scrolls into view and previews
     assert page.get_attribute("#output-preview-image", "src").endswith(oldest)
     assert page.get_attribute("#output-preview-link", "href").endswith(oldest)
+    assert "selected" in page.get_attribute("#recent button:nth-child(8)", "class")
+    assert "selected" not in page.get_attribute("#recent button:nth-child(1)", "class")
     page.wait_for_function("document.getElementById('output-preview-image').naturalWidth > 0")
-    page.select_option("#output-select", "")
+    page.click("#recent button:nth-child(8)")  # clicking again deselects
     assert page.is_hidden("#output-preview")
+    assert page.is_disabled("#reuse-btn")
     page.click("#recent button:nth-child(1)")
     page.click("#reuse-btn")
     page.wait_for_function(f"document.getElementById('image-select').value === {newest!r}")

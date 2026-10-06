@@ -174,13 +174,14 @@
     display: flex; gap: 8px; overflow-x: auto; padding: 10px 2px 4px;
     scrollbar-width: thin;
   }
-  .strip button, .recent button {
+  .strip button {
     flex: 0 0 auto; padding: 0; border: 2px solid transparent; border-radius: 8px;
     background: var(--input-bg); overflow: hidden; line-height: 0;
   }
   .strip button { width: 64px; height: 64px; }
-  .strip button.selected, .recent button.selected { border-color: var(--busy); }
-  .strip img, .recent img { width: 100%; height: 100%; object-fit: cover; }
+  .strip .empty-hint { color: var(--muted); font-size: 0.82rem; line-height: 64px; }
+  .strip button.selected { border-color: var(--busy); }
+  .strip img { width: 100%; height: 100%; object-fit: cover; }
 
   .progress-row { display: flex; justify-content: space-between; gap: 10px; font-size: 0.82rem; margin-bottom: 8px; }
   .progress-row .muted { color: var(--muted); flex: none; }
@@ -200,9 +201,6 @@
     color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow-y: auto;
   }
 
-  .recent { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin: 12px 0 10px; }
-  .recent button { aspect-ratio: 1; }
-  .recent .empty-hint { grid-column: 1 / -1; color: var(--muted); font-size: 0.82rem; }
 
   .field-error { margin-top: 8px; font-size: 0.8rem; color: var(--danger); }
   .field-error:empty { display: none; }
@@ -338,11 +336,7 @@
   <section>
     <details id="previous-outputs">
       <summary>Previous outputs</summary>
-      <div class="recent" id="recent"><span class="empty-hint">No outputs yet</span></div>
-      <div class="select-wrap">
-        <select id="output-select"><option value="">Select any previous output&hellip;</option></select>
-        <span class="chevron">&#9662;</span>
-      </div>
+      <div class="strip" id="recent"><span class="empty-hint">No outputs yet</span></div>
       <div class="viewer" id="output-preview" style="margin-top: 10px;" hidden>
         <a id="output-preview-link" target="_blank" rel="noopener"><img id="output-preview-image" alt="Selected previous output"></a>
       </div>
@@ -388,6 +382,7 @@ let lastInputsMtime = null;
 let latestJobId = null;
 let latestJob = null;
 let selectedIndex = 0;
+let selectedOutput = null;  // previous output chosen in the band
 let offline = false;
 
 async function api(path, options) {
@@ -558,9 +553,9 @@ function renderLatest(job) {
 
 async function refreshOutputs() {
   const { files } = await api('api/outputs');
-  const select = $('output-select');
-  fillSelect(select, files, select.value, 'Select any previous output…');
+  if (!files.includes(selectedOutput)) selectedOutput = null;
   const recent = $('recent');
+  const scroll = recent.scrollLeft;
   recent.replaceChildren();
   if (!files.length) {
     const hint = document.createElement('span');
@@ -568,7 +563,7 @@ async function refreshOutputs() {
     hint.textContent = 'No outputs yet';
     recent.appendChild(hint);
   }
-  for (const name of files.slice(0, 5)) {
+  for (const name of files) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.title = name;
@@ -579,16 +574,17 @@ async function refreshOutputs() {
     img.loading = 'lazy';
     btn.appendChild(img);
     btn.addEventListener('click', () => {
-      select.value = name;
+      selectedOutput = selectedOutput === name ? null : name;  // click again to deselect
       syncRecentSelection();
     });
     recent.appendChild(btn);
   }
+  recent.scrollLeft = scroll;
   syncRecentSelection();
 }
 
 function syncRecentSelection() {
-  const value = $('output-select').value;
+  const value = selectedOutput;
   for (const btn of $('recent').querySelectorAll('button')) {
     btn.classList.toggle('selected', btn.dataset.name === value);
   }
@@ -679,7 +675,6 @@ $('prompt').addEventListener('input', (e) => { $('prompt-count').textContent = e
 $('negative-prompt').addEventListener('input', (e) => { $('negative-count').textContent = e.target.value.length; });
 $('images').addEventListener('input', updateGenerateLabel);
 $('image-select').addEventListener('change', () => { storageSet($('image-select').value); updateImageMode(); });
-$('output-select').addEventListener('change', syncRecentSelection);
 
 $('randomize-seed').addEventListener('click', () => {
   const values = new Uint32Array(1);
@@ -747,7 +742,7 @@ $('clear-queue-btn').addEventListener('click', async () => {
 $('reuse-btn').addEventListener('click', async () => {
   const errorEl = $('reuse-error');
   errorEl.textContent = '';
-  const name = $('output-select').value;
+  const name = selectedOutput;
   if (!name) return;
   try {
     const result = await api('api/reuse-output', {

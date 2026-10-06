@@ -162,7 +162,7 @@ session); positive and negative prompts with a syntax hint; knobs (width, height
 sampler, seed + randomize, images, strength only for img2img); Generate (usable while loading)
 with queue count and Clear queue; latest result (one large image that opens the PNG,
 horizontal thumbnail strip, seed + resolved prompt); progress bar; generation log (server lines,
-last ~100); previous outputs (5 newest thumbnails, dropdown of all, reuse as input); danger
+last ~100); previous outputs (**(owner)** a scrolling band of all output thumbnails, newest first — click to preview, reuse as input); danger
 zone (confirm, then clear all).
 
 ## 11. CLI
