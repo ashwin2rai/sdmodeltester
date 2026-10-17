@@ -89,8 +89,9 @@ The `.safetensors` file is only the transformer: a plain BF16 file (e.g. Comfy-O
 `z_image_turbo_fp8_e4m3fn.safetensors`, 5.7 GiB; kept in FP8 on the GPU, computed in BF16).
 The text encoder (Qwen3-4B) and VAE are downloaded from `Tongyi-MAI/Z-Image-Turbo` on first
 load (~7.7 GiB). Defaults: 1024², 9 steps, CFG 0, sampler `flow_euler`; `(text:1.2)` weights are
-ignored; sizes are multiples of 16. Scaled-FP8 / int8 / NVFP4 files are rejected —
-`doctor --model-family zimage --model <file>` checks a file before loading.
+ignored; sizes are multiples of 16. ComfyUI **scaled FP8** files (most Civitai "fp8" fine-tunes)
+are dequantized to BF16 on load (BF16 VRAM). int8 / NVFP4 / Diffusers-layout files are
+rejected — `doctor --model-family zimage --model <file>` checks a file before loading.
 
 ```bash
 python -m src.cli serve --model-family zimage --model models/z_image_turbo_fp8_e4m3fn.safetensors

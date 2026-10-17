@@ -526,7 +526,7 @@ def test_benchmark_and_functional_checks_real_backend(family, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Z-Image: real single-file loader (BF16 and plain FP8 files) on a tiny model
+# Z-Image: real single-file loader (BF16, plain FP8, ComfyUI scaled FP8) on a tiny model
 # ---------------------------------------------------------------------------
 
 
@@ -627,7 +627,23 @@ def zimage_files(tmp_path_factory):
     weights = comfy_state_dict(pipe.transformer)
     for name, dtype in ZIMAGE_FILES.items():
         save_file({k: v.to(dtype) for k, v in weights.items()}, root / f"z_{name}.safetensors")
+    save_file(comfy_scaled_fp8(weights), root / "z_scaled_fp8.safetensors")
     return root
+
+
+def comfy_scaled_fp8(weights):
+    """ComfyUI quantized layout: linear weights as FP8 / scale (+ weight_scale, comfy_quant)."""
+    config = list(b'{"format": "float8_e4m3fn"}')
+    out = {}
+    for key, value in weights.items():
+        if value.ndim != 2 or not key.endswith(".weight"):
+            out[key] = value.to(torch.bfloat16)
+            continue
+        scale = value.abs().max().float() / 448  # e4m3 max
+        out[key] = (value / scale).to(torch.float8_e4m3fn)
+        out[f"{key}_scale"] = scale
+        out[key.removesuffix("weight") + "comfy_quant"] = torch.tensor(config, dtype=torch.uint8)
+    return out
 
 
 def make_zimage_backend(zimage_files, name="bf16", **kwargs):
@@ -669,6 +685,20 @@ def test_zimage_loads_with_storage_dtype_and_shared_img2img(zimage):
         assert getattr(zimage.img2img, name) is getattr(zimage.txt2img, name)
     label = str(storage).removeprefix("torch.")
     assert any(f"Transformer weights: {label}" in line for line in zimage.logs)
+
+
+def test_zimage_scaled_fp8_is_dequantized(load_zimage, tmp_path):
+    backend = load_zimage("scaled_fp8")
+    loaded = backend.txt2img.transformer.state_dict()
+    path = Path(backend.zimage_components) / "transformer"
+    original = diffusers.ZImageTransformer2DModel.from_pretrained(path).state_dict()
+    assert {v.dtype for v in loaded.values()} == {torch.bfloat16}
+    for key in ("layers.0.attention.to_q.weight", "layers.0.feed_forward.w1.weight"):
+        error = (loaded[key].float() - original[key]).norm() / original[key].norm()
+        assert error < 0.1  # FP8 rounding only; a missing scale would be off by ~100x
+    assert any("scaled FP8, dequantized to bfloat16" in line for line in backend.logs)
+    result = backend.generate(resolve_job(zimage_request(steps=2), family="zimage"), tmp_path)
+    assert len(result.output_paths) == 1
 
 
 def test_zimage_txt2img_batch(zimage, tmp_path):

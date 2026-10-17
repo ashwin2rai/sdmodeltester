@@ -39,8 +39,9 @@ from src.backend import (
     ValidationError,
     configure_cuda_allocator,
     describe_request,
+    describe_weight_format,
     resolve_job,
-    zimage_storage_dtype,
+    zimage_weight_format,
 )
 
 EXIT_OK, EXIT_FAILURE, EXIT_USAGE = 0, 1, 2
@@ -393,14 +394,9 @@ def collect_diagnostics(
 
 def _zimage_weights(model: Path) -> Check:
     try:
-        storage = zimage_storage_dtype(model)
+        return Check("Z-Image weights", describe_weight_format(zimage_weight_format(model)))
     except ValueError as exc:
-        return Check(
-            "Z-Image weights", str(exc), "fail", "use a plain BF16 or FP8 transformer file"
-        )
-    return Check(
-        "Z-Image weights", f"{storage} storage, bfloat16 compute" if storage else "bfloat16"
-    )
+        return Check("Z-Image weights", str(exc), "fail", "use a BF16 or FP8 transformer file")
 
 
 def format_checks(checks: Sequence[Check]) -> list[str]:

@@ -707,6 +707,10 @@ _ZIMAGE_KEYS = (
     "model.diffusion_model.layers.0.adaLN_modulation.0.weight",
 )
 _FP8_DTYPES = {"F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2"}
+SCALED_FP8 = "scaled_fp8"
+# ComfyUI quantized layers: X.weight (FP8) + X.weight_scale (F32) + X.comfy_quant (U8 JSON
+# config, e.g. {"format": "float8_e4m3fn"}) and optionally X.input_scale (activations only).
+_COMFY_QUANT_EXTRAS = (".comfy_quant", ".input_scale")
 
 
 def read_safetensors_header(path: Path) -> dict[str, Any]:
@@ -720,23 +724,55 @@ def read_safetensors_header(path: Path) -> dict[str, Any]:
     return header
 
 
-def zimage_storage_dtype(path: Path) -> str | None:
-    """FP8 storage dtype of a Z-Image transformer file (``None`` = BF16/FP16/FP32 weights).
+def zimage_weight_format(path: Path) -> str | None:
+    """Weight format of a Z-Image transformer file, from its header.
 
-    Only plain checkpoints are supported: weights cast straight to FP8, same names as the
-    BF16 release. Scaled-FP8 / int8 / NVFP4 files need their own loaders and are rejected.
+    ``None``: BF16/FP16/FP32 weights. ``"float8_e4m3fn"`` / ``"float8_e5m2"``: plain FP8
+    (weights cast straight to FP8, same names as the BF16 release). ``SCALED_FP8``: ComfyUI's
+    quantized FP8 (FP8 weight x F32 ``weight_scale`` per layer). Other quantized formats
+    (int8, NVFP4, other scale layouts) need their own loaders and are rejected.
     """
     header = read_safetensors_header(path)
     if not any(key in header for key in _ZIMAGE_KEYS):
         raise ValueError(f"{path.name} is not a Z-Image transformer checkpoint")
-    if any("scale" in key.rsplit(".", 1)[-1] for key in header):
-        raise ValueError(f"{path.name} is a scaled/quantized checkpoint; use a plain BF16/FP8 file")
-    dtypes = {info["dtype"] for info in header.values()}
+    if "all_x_embedder.2-1.weight" in header:  # the single-file converter expects ComfyUI names
+        raise ValueError(f"{path.name} uses Diffusers tensor names; use a ComfyUI-layout file")
+    scaled = {key.removesuffix("_scale") for key in header if key.endswith(".weight_scale")}
+    weights = {
+        key: info["dtype"]
+        for key, info in header.items()
+        if not key.endswith((*_COMFY_QUANT_EXTRAS, ".weight_scale"))
+    }
+    if any("scale" in key.rsplit(".", 1)[-1] for key in weights):
+        raise ValueError(f"{path.name} uses an unsupported quantization; use BF16 or FP8")
+    dtypes = set(weights.values())
     fp8 = {_FP8_DTYPES[d] for d in dtypes if d in _FP8_DTYPES}
     unsupported = dtypes - set(_FP8_DTYPES) - {"BF16", "F16", "F32"}
-    if unsupported or len(fp8) > 1:
+    if unsupported or len(fp8) > 1 or any(weights.get(w) not in _FP8_DTYPES for w in scaled):
         raise ValueError(f"{path.name}: unsupported weight types {', '.join(sorted(dtypes))}")
+    if scaled:
+        return SCALED_FP8
     return fp8.pop() if fp8 else None
+
+
+def describe_weight_format(fmt: str | None, compute: str = "bfloat16") -> str:
+    if fmt == SCALED_FP8:
+        return f"scaled FP8, dequantized to {compute}"
+    return f"{fmt} storage, {compute} compute" if fmt else compute
+
+
+def dequantize_scaled_fp8(path: Path, dtype: Any) -> dict[str, Any]:
+    """ComfyUI scaled-FP8 file -> plain state dict: ``weight x weight_scale`` in ``dtype``.
+
+    The scale is a scalar or one value per output row (broadcasts either way).
+    """
+    from safetensors.torch import load_file
+
+    state = load_file(str(path))
+    for key in [k for k in state if k.endswith(".weight_scale")]:
+        weight = key.removesuffix("_scale")
+        state[weight] = (state[weight].float() * state.pop(key)).to(dtype)
+    return {k: v for k, v in state.items() if not k.endswith(_COMFY_QUANT_EXTRAS)}
 
 
 def configure_cuda_allocator() -> None:
@@ -846,22 +882,22 @@ class DiffusersBackend(_BatchedBackend):
         import diffusers
         import torch
 
-        storage = zimage_storage_dtype(self.model_path)
+        path, fmt = self.model_path, zimage_weight_format(self.model_path)
+        # Scaled FP8 is dequantized once, exactly, to BF16 (re-casting to plain FP8 would
+        # quantize twice), so it needs BF16 VRAM.
+        source = dequantize_scaled_fp8(path, dtype) if fmt == SCALED_FP8 else str(path)
         transformer = diffusers.ZImageTransformer2DModel.from_single_file(
-            str(self.model_path),
-            config=self.zimage_components,
-            subfolder="transformer",
-            torch_dtype=dtype,
+            source, config=self.zimage_components, subfolder="transformer", torch_dtype=dtype
         )
-        if storage:
+        if fmt in _FP8_DTYPES.values():
             # Keep weights in FP8 (half the VRAM), upcast per layer to compute in BF16. Exact
             # for a plain FP8 file; saves memory, not time. Precision-sensitive layers stay BF16.
             transformer.enable_layerwise_casting(
-                storage_dtype=getattr(torch, storage), compute_dtype=dtype
+                storage_dtype=getattr(torch, fmt), compute_dtype=dtype
             )
         self.log(
-            f"Transformer weights: {storage or self.dtype_name}; loading text encoder + VAE "
-            f"from {self.zimage_components} (first run downloads ~7.7 GiB)"
+            f"Transformer weights: {describe_weight_format(fmt, self.dtype_name)}; loading text "
+            f"encoder + VAE from {self.zimage_components} (first run downloads ~7.7 GiB)"
         )
         return diffusers.ZImagePipeline.from_pretrained(
             self.zimage_components, transformer=transformer, torch_dtype=dtype

@@ -104,6 +104,9 @@ def test_cells_end_to_end(tmp_path, capsys):
             assert response.status == 200
         run(3)  # re-running the cell restarts the server
         assert ns["cu"].port_open(port)
+        ns["MODEL_FAMILY"] = "zimage"
+        run(3)  # zimage adds a note about its background download
+        assert "server.log" in outputs.pop()
     finally:
         if "cu" in ns:
             ns["cu"].stop_server(repo_dir / "server.pid")

@@ -111,6 +111,10 @@ where we are, and what we learned.
 
 ## Learnings
 
+- Civitai "fp8" Z-Image fine-tunes (e.g. moodyProMix) are ComfyUI scaled FP8: `weight` F8 +
+  `weight_scale` F32 + `comfy_quant` U8 per linear layer, under `model.diffusion_model.`. Our
+  first header check rejected them; they are now dequantized at load (2026-10-17).
+
 - diffusers 0.40 `from_pipe` casts all shared modules to `dtype` (default float32) — pass the
   pipeline's dtype; for FP8 layerwise-cast modules build the pipeline from `pipe.components`
   instead (any `.to(dtype)` turns FP8 storage back into BF16). Device-only `.to()` is safe.

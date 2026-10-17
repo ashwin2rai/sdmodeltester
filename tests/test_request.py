@@ -18,7 +18,7 @@ from src.backend import (
     resolve_job,
     round_dimension,
     validate_request,
-    zimage_storage_dtype,
+    zimage_weight_format,
 )
 from tests.test_seeds import make_request
 
@@ -231,6 +231,15 @@ def write_safetensors(path, tensors):
 
 
 ZKEY = "layers.0.adaLN_modulation.0.weight"
+# ComfyUI quantized FP8 layout (as in Civitai "fp8" files and Comfy-Org's *_fp8_mixed).
+QKV = "model.diffusion_model.layers.0.attention.qkv"
+COMFY_SCALED = {
+    "model.diffusion_model." + ZKEY: "BF16",
+    f"{QKV}.weight": "F8_E4M3",
+    f"{QKV}.weight_scale": "F32",
+    f"{QKV}.comfy_quant": "U8",
+    f"{QKV}.input_scale": "F32",
+}
 
 
 @pytest.mark.parametrize(
@@ -240,29 +249,33 @@ ZKEY = "layers.0.adaLN_modulation.0.weight"
         ({ZKEY: "F8_E4M3", "x_embedder.weight": "F8_E4M3"}, "float8_e4m3fn"),
         ({ZKEY: "F8_E5M2", "layers.0.attention_norm1.weight": "BF16"}, "float8_e5m2"),
         ({"model.diffusion_model." + ZKEY: "F8_E4M3"}, "float8_e4m3fn"),
+        (COMFY_SCALED, "scaled_fp8"),
     ],
 )
-def test_zimage_storage_dtype(tmp_path, dtypes, expected):
-    assert zimage_storage_dtype(write_safetensors(tmp_path / "z.safetensors", dtypes)) == expected
+def test_zimage_weight_format(tmp_path, dtypes, expected):
+    assert zimage_weight_format(write_safetensors(tmp_path / "z.safetensors", dtypes)) == expected
 
 
 @pytest.mark.parametrize(
     ("dtypes", "fragment"),
     [
         ({"model.diffusion_model.input_blocks.0.0.weight": "F16"}, "not a Z-Image"),
-        ({ZKEY: "F8_E4M3", "layers.0.feed_forward.w1._weight_scale": "F32"}, "scaled/quantized"),
-        ({ZKEY: "F8_E4M3", "layers.0.feed_forward.w1.scale_weight": "F32"}, "scaled/quantized"),
+        ({ZKEY: "F8_E4M3", "layers.0.feed_forward.w1._weight_scale": "F32"}, "quantization"),
+        ({ZKEY: "F8_E4M3", "layers.0.feed_forward.w1.scale_weight": "F32"}, "quantization"),
+        ({**COMFY_SCALED, f"{QKV}.weight_scale_2": "F32"}, "quantization"),  # NVFP4
+        ({**COMFY_SCALED, f"{QKV}.weight": "I8"}, "unsupported weight types"),  # int8
         ({ZKEY: "I8"}, "unsupported weight types"),
+        ({ZKEY: "BF16", "all_x_embedder.2-1.weight": "BF16"}, "Diffusers tensor names"),
         ({ZKEY: "F8_E4M3", "x_embedder.weight": "F8_E5M2"}, "unsupported weight types"),
     ],
 )
-def test_zimage_storage_dtype_rejects(tmp_path, dtypes, fragment):
+def test_zimage_weight_format_rejects(tmp_path, dtypes, fragment):
     with pytest.raises(ValueError, match=fragment):
-        zimage_storage_dtype(write_safetensors(tmp_path / "z.safetensors", dtypes))
+        zimage_weight_format(write_safetensors(tmp_path / "z.safetensors", dtypes))
 
 
-def test_zimage_storage_dtype_rejects_non_safetensors(tmp_path):
+def test_zimage_weight_format_rejects_non_safetensors(tmp_path):
     bad = tmp_path / "bad.safetensors"
     bad.write_bytes(b"not a safetensors file")
     with pytest.raises(ValueError, match="not a valid"):
-        zimage_storage_dtype(bad)
+        zimage_weight_format(bad)

@@ -82,8 +82,14 @@ argument, which defaults to float32 — img2img is always built with the pipelin
   **plain FP8** (`F8_E4M3` / `F8_E5M2`: every tensor cast straight to FP8, same names as BF16).
   FP8 stays FP8 in VRAM via `enable_layerwise_casting` (storage = the file's FP8 type, compute
   BF16; diffusers keeps `t_embedder`/`cap_embedder`/norms in BF16). Memory saving only — not
-  faster; no torchao. Scaled-FP8 (`*_weight_scale`, `scale_weight`), int8 and NVFP4 files and
-  non-Z-Image files are rejected with a clear error (also by `doctor --model`).
+  faster; no torchao.
+- **ComfyUI scaled FP8** (most Civitai "fp8" fine-tunes): per layer `X.weight` (FP8) +
+  `X.weight_scale` (F32, scalar or per row) + `X.comfy_quant` (U8 JSON) [+ `X.input_scale`].
+  Dequantized once at load (`weight × weight_scale` → BF16, exact), so it needs BF16 VRAM;
+  re-casting to plain FP8 would quantize twice. Found 2026-10-17 on a real Civitai file.
+- Rejected with a clear error (also by `doctor --model`): int8 / NVFP4 (`weight_scale_2`) /
+  other scale layouts (`_weight_scale`, `scale_weight`), Diffusers-layout files (the
+  single-file converter expects ComfyUI names), non-Z-Image files.
 - img2img is constructed from the loaded components (not `from_pipe`, whose dtype cast would
   undo FP8 storage).
 - Defaults: 1024×1024, **9 steps** (= 8 transformer passes), **CFG 0** (distilled; CFG > 0
