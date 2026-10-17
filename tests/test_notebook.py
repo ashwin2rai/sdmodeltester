@@ -123,7 +123,7 @@ def test_cells_end_to_end(tmp_path, capsys):
     ]
 
 
-@pytest.mark.parametrize("family", ["sd15", "sdxl"])
+@pytest.mark.parametrize("family", ["sd15", "sdxl", "zimage"])
 def test_settings_cell_runs(family):
     ns: dict = {}
     exec(CELLS[0].replace('MODEL_FAMILY = "sdxl"', f'MODEL_FAMILY = "{family}"'), ns)

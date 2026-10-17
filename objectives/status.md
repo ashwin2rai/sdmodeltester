@@ -4,7 +4,7 @@ Persistent memory for development sessions — read first when resuming, update 
 What the repo must do (incl. all owner decisions) is in `SPEC.md`; this file is how we work,
 where we are, and what we learned.
 
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-17
 
 ## Working agreement (owner)
 
@@ -37,6 +37,8 @@ where we are, and what we learned.
 | Colab notebook + helpers (SPEC §12), consolidation, notebook tokens | done — awaiting owner review/commit |
 | Run `benchmark` on a real L4 for SD1.5 + SDXL, pick the default profile, write `compat/known-good-colab.md` | needs Colab |
 | Run the notebook on Colab, fix what reality finds, pin `requirements-inference.txt` ranges | needs Colab |
+| Z-Image Turbo family (`zimage`, SPEC §4a): BF16 + plain FP8 transformer files, tiny-model CPU tests through the real single-file loader | done locally — awaiting owner review; needs Colab |
+| Fix: img2img `from_pipe` upcast SD/SDXL to FP32 (SPEC §4) | done — re-measure SD/SDXL speed/VRAM on Colab |
 
 ## Verified against Colab without a GPU (2026-10-04)
 
@@ -73,6 +75,14 @@ where we are, and what we learned.
 
 ## Still unverified (needs Colab)
 
+- Z-Image on the L4 (2026-10-17, built without downloading the 7.7 GiB text encoder): real
+  `from_single_file` on the Comfy BF16 and drbaph FP8 files (headers were checked remotely:
+  same 453 tensor names, plain casts), Hub fetch of `Tongyi-MAI/Z-Image-Turbo` components,
+  VRAM (est. BF16 ~19.3 GiB / FP8 ~13.5 GiB resident) and batch OOM limits at 1024², speed
+  (est. ~1 s/step), FP8 vs BF16 quality (e5m2 expected worse), `compile` on the transformer.
+- SD/SDXL timings and VRAM from the 2026-10-04 run were measured while everything ran in FP32
+  (`from_pipe` bug); they should drop after the fix.
+
 - `from_single_file` FP16 on CUDA for both families (Hub config fetch); SDXL FP16 VAE black
   images; `torch.compile` speed per profile; OOM thresholds at 1024² × 10; visual quality of
   weighting/samplers.
@@ -100,6 +110,14 @@ where we are, and what we learned.
   SD1.5/SDXL pipelines + an offline CLIP tokenizer in `tests/test_diffusers_cpu.py`.
 
 ## Learnings
+
+- diffusers 0.40 `from_pipe` casts all shared modules to `dtype` (default float32) — pass the
+  pipeline's dtype; for FP8 layerwise-cast modules build the pipeline from `pipe.components`
+  instead (any `.to(dtype)` turns FP8 storage back into BF16). Device-only `.to()` is safe.
+- Z-Image tiny pipeline: Qwen3 tokenizer = `PreTrainedTokenizerFast` over a byte-level BPE with
+  empty merges + a chat template; transformer `axes_lens[0]` must exceed caption tokens + 1
+  (prompts are padded to 512, real model uses 1024). Comfy layout = fused `attention.qkv`,
+  `out`, `k_norm`/`q_norm`, `x_embedder.`/`final_layer.` (inverse of diffusers' converter).
 
 - transformers 5 `CLIPTokenizer` is tokenizers-backed: build offline with
   `CLIPTokenizer(vocab=dict, merges=[])`; `bytes_to_unicode` is in

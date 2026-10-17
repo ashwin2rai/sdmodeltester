@@ -11,6 +11,7 @@ from src.prompting import (
     parse_weighted,
     resolve_prompt_pair,
     resolve_template,
+    strip_weights,
     weighted_token_ids,
 )
 
@@ -86,6 +87,12 @@ def test_parse_weighted_variants():
     assert parse_weighted("(bg: .5 )") == [("bg", 0.5)]
     assert parse_weighted("(x:2)(y:2)") == [("xy", 2.0)]  # equal weights merge
     assert parse_weighted("") == []
+
+
+def test_strip_weights():
+    assert strip_weights("a (white hair:1.2) cat, (bg:0.7)") == "a white hair cat, bg"
+    assert strip_weights("a (plain) cat \\(x\\)") == "a (plain) cat (x)"
+    assert strip_weights("") == ""
 
 
 def test_parse_weighted_literal_parentheses():

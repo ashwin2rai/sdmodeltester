@@ -1,7 +1,9 @@
-"""Real DiffusersBackend on CPU with tiny random SD1.5/SDXL pipelines.
+"""Real DiffusersBackend on CPU with tiny random SD1.5/SDXL/Z-Image pipelines.
 
-No checkpoint, no network: models are built from small configs and the CLIP tokenizer
-from an in-memory byte-level vocab. Requires the optional inference stack::
+No checkpoint, no network: models are built from small configs and the CLIP/Qwen tokenizers
+from an in-memory byte-level vocab. Z-Image goes through the real single-file loader: a tiny
+transformer is written as a ComfyUI-layout BF16/FP8 file next to a local components folder.
+Requires the optional inference stack::
 
     uv sync --group inference-cpu
 
@@ -9,6 +11,7 @@ Skipped automatically when torch/diffusers are not installed. What these tests c
 cover (single-file loading, CUDA, fp16, speed, image quality) is left to Phase 8 on Colab.
 """
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ from PIL import Image  # noqa: E402
 
 import src.backend  # noqa: E402
 from src.backend import (  # noqa: E402
+    FAMILIES,
     SAMPLER_IDS,
     DiffusersBackend,
     GenerationError,
@@ -28,6 +32,7 @@ from src.backend import (  # noqa: E402
     resolve_job,
 )
 from src.prompting import encode_prompt_batch  # noqa: E402
+from tests.test_request import write_safetensors  # noqa: E402
 from tests.test_seeds import make_request  # noqa: E402
 
 pytestmark = pytest.mark.torch
@@ -154,18 +159,17 @@ def build_sdxl():
 BUILDERS = {"sd15": build_sd15, "sdxl": build_sdxl}
 
 
-def make_backend(family, **kwargs):
+def make_backend(family, model=None, **kwargs):
     logs = []
-    backend = DiffusersBackend(
-        family,
-        f"tiny-{family}.safetensors",
+    options = dict(
         device="cpu",
         dtype="float32",
         warmup_steps=1,
         warmup_size=(SIZE, SIZE),
-        log=logs.append,
-        pipeline_loader=BUILDERS[family],
-        **kwargs,
+        pipeline_loader=BUILDERS.get(family),
+    )
+    backend = DiffusersBackend(
+        family, model or f"tiny-{family}.safetensors", log=logs.append, **{**options, **kwargs}
     )
     backend.logs = logs
     return backend
@@ -213,6 +217,16 @@ def test_img2img_shares_weights(loaded):
         assert loaded.img2img.text_encoder_2 is loaded.txt2img.text_encoder_2
 
 
+@pytest.mark.parametrize("family", ["sd15", "sdxl"])
+def test_load_keeps_half_precision(family):
+    """Regression: ``from_pipe`` defaults to float32 and would upcast the shared modules."""
+    half = lambda: BUILDERS[family]().to(torch.float16)  # noqa: E731
+    backend = make_backend(family, dtype="float16", pipeline_loader=half)
+    backend.load()
+    for pipe in (backend.txt2img, backend.img2img):
+        assert {pipe.unet.dtype, pipe.vae.dtype, pipe.text_encoder.dtype} == {torch.float16}
+
+
 def test_safety_checker_and_watermark_disabled(loaded):
     for pipe in (loaded.txt2img, loaded.img2img):
         if loaded.family == "sd15":
@@ -232,6 +246,7 @@ EXPECTED = {
     "euler_a": ("EulerAncestralDiscreteScheduler", None, None),
     "heun": ("HeunDiscreteScheduler", None, False),
     "dpm2_karras": ("KDPM2DiscreteScheduler", None, True),
+    "flow_euler": ("FlowMatchEulerDiscreteScheduler", None, None),
 }
 
 
@@ -248,9 +263,9 @@ def test_scheduler_mapping(sampler):
         assert scheduler.config.use_karras_sigmas is karras
 
 
-@pytest.mark.parametrize("sampler", SAMPLER_IDS)
+@pytest.mark.parametrize("sampler", FAMILIES["sd15"].samplers)  # sd15 and sdxl share the list
 def test_every_sampler_generates(loaded, tmp_path, sampler):
-    job = resolve_job(tiny_request(sampler=sampler, seed=3))
+    job = resolve_job(tiny_request(sampler=sampler, seed=3), family="sd15")
     result = loaded.generate(job, tmp_path)
     assert len(result.output_paths) == 1
 
@@ -325,7 +340,7 @@ def test_sdxl_empty_negative_is_zeros():
 
 def test_txt2img_batch_writes_ordered_pngs_with_progress(loaded, tmp_path):
     events = []
-    job = resolve_job(tiny_request(seed=10, num_images=3, steps=3), job_id=5)
+    job = resolve_job(tiny_request(seed=10, num_images=3, steps=3), job_id=5, family="sd15")
     result = loaded.generate(job, tmp_path, lambda f, m: events.append((f, m)))
     assert result.seeds == (10, 11, 12)
     assert [p.name.split("_")[-1] for p in result.output_paths] == [
@@ -344,8 +359,10 @@ def test_image_depends_only_on_its_seed(loaded, tmp_path):
     """Batch composition must not change an image (so OOM splitting is invisible)."""
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
-    batch = loaded.generate(resolve_job(tiny_request(seed=20, num_images=2)), tmp_path / "a")
-    alone = loaded.generate(resolve_job(tiny_request(seed=21)), tmp_path / "b")
+    batch = loaded.generate(
+        resolve_job(tiny_request(seed=20, num_images=2), family="sd15"), tmp_path / "a"
+    )
+    alone = loaded.generate(resolve_job(tiny_request(seed=21), family="sd15"), tmp_path / "b")
     with Image.open(batch.output_paths[1]) as x, Image.open(alone.output_paths[0]) as y:
         diff = max(abs(a - b) for a, b in zip(x.tobytes(), y.tobytes(), strict=True))
     assert diff <= 2
@@ -358,7 +375,8 @@ def test_img2img(loaded, tmp_path):
     out_dir.mkdir()
     events = []
     job = resolve_job(
-        tiny_request(input_image=src, strength=0.5, steps=4, num_images=2, width=64, height=80)
+        tiny_request(input_image=src, strength=0.5, steps=4, num_images=2, width=64, height=80),
+        family="sd15",
     )
     result = loaded.generate(job, out_dir, lambda f, m: events.append(m))
     assert len(result.output_paths) == 2
@@ -383,7 +401,9 @@ def test_oom_fallback_on_real_pipeline(tmp_path):
     backend.txt2img.__class__ = type(
         "Limited", (type(backend.txt2img),), {"__call__": limited_call}
     )
-    result = backend.generate(resolve_job(tiny_request(num_images=5, steps=1)), tmp_path)
+    result = backend.generate(
+        resolve_job(tiny_request(num_images=5, steps=1), family="sd15"), tmp_path
+    )
     assert len(result.output_paths) == 5
     assert sizes == [5, 2, 2, 1]
     assert backend.batcher.limits[("txt2img", SIZE, SIZE)] == 2
@@ -392,7 +412,7 @@ def test_oom_fallback_on_real_pipeline(tmp_path):
 
 def test_generate_before_load_fails(tmp_path):
     with pytest.raises(GenerationError):
-        make_backend("sd15").generate(resolve_job(tiny_request()), tmp_path)
+        make_backend("sd15").generate(resolve_job(tiny_request(), family="sd15"), tmp_path)
 
 
 def test_warmup_writes_no_files(tmp_path, monkeypatch):
@@ -434,7 +454,7 @@ def test_compile_failure_at_warmup_falls_back(monkeypatch, tmp_path):
     assert not isinstance(backend.txt2img.unet, Broken)
     assert backend.img2img.unet is backend.txt2img.unet
     assert any("falling back to baseline" in line for line in backend.logs)
-    result = backend.generate(resolve_job(tiny_request(steps=1)), tmp_path)
+    result = backend.generate(resolve_job(tiny_request(steps=1), family="sd15"), tmp_path)
     assert len(result.output_paths) == 1
 
 
@@ -503,3 +523,216 @@ def test_benchmark_and_functional_checks_real_backend(family, tmp_path):
     checks = benchmark.functional_checks(backend, family, tmp_path / "func", **small)
     failed = {c.name: c.detail for c in checks if not c.ok}
     assert failed == {}
+
+
+# ---------------------------------------------------------------------------
+# Z-Image: real single-file loader (BF16 and plain FP8 files) on a tiny model
+# ---------------------------------------------------------------------------
+
+
+def tiny_qwen_tokenizer():
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    vocab = {c: i for i, c in enumerate(bytes_to_unicode().values())}
+    for special in ("<|endoftext|>", "<|im_start|>", "<|im_end|>"):
+        vocab[special] = len(vocab)
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        pad_token="<|endoftext|>",
+        eos_token="<|im_end|>",
+        additional_special_tokens=["<|im_start|>", "<|im_end|>"],
+    )
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+        "{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    )
+    return tokenizer
+
+
+def build_zimage():
+    torch.manual_seed(0)
+    tokenizer = tiny_qwen_tokenizer()
+    text_encoder = transformers.Qwen3Model(
+        transformers.Qwen3Config(
+            vocab_size=len(tokenizer), hidden_size=32, intermediate_size=37,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+            max_position_embeddings=1024,
+        )
+    )  # fmt: skip
+    vae = diffusers.AutoencoderKL(
+        block_out_channels=[32, 64],
+        in_channels=3,
+        out_channels=3,
+        down_block_types=["DownEncoderBlock2D"] * 2,
+        up_block_types=["UpDecoderBlock2D"] * 2,
+        latent_channels=16,
+        scaling_factor=0.3611,
+        shift_factor=0.1159,
+        use_quant_conv=False,
+        use_post_quant_conv=False,
+    )
+    transformer = diffusers.ZImageTransformer2DModel(
+        in_channels=16, dim=32, n_layers=2, n_refiner_layers=1, n_heads=2, n_kv_heads=2,
+        cap_feat_dim=32, axes_dims=[4, 6, 6], axes_lens=[1024, 32, 32],
+    )  # fmt: skip
+    return diffusers.ZImagePipeline(
+        scheduler=diffusers.FlowMatchEulerDiscreteScheduler(shift=3.0),
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        transformer=transformer,
+    )
+
+
+def comfy_state_dict(transformer):
+    """Diffusers -> ComfyUI key layout (inverse of diffusers' Z-Image single-file converter)."""
+    sd = transformer.state_dict()
+    renames = {
+        "all_final_layer.2-1.": "final_layer.",
+        "all_x_embedder.2-1.": "x_embedder.",
+        ".attention.to_out.0.": ".attention.out.",
+        ".attention.norm_k.": ".attention.k_norm.",
+        ".attention.norm_q.": ".attention.q_norm.",
+    }
+    out = {}
+    for key, value in sd.items():
+        if ".attention.to_k." in key or ".attention.to_v." in key:
+            continue
+        if ".attention.to_q.weight" in key:
+            stem = key.removesuffix(".to_q.weight")
+            qkv = [sd[f"{stem}.to_{x}.weight"] for x in "qkv"]
+            out[f"{stem}.qkv.weight"] = torch.cat(qkv)
+            continue
+        for old, new in renames.items():
+            key = key.replace(old, new)
+        out[key] = value.contiguous()
+    return out
+
+
+ZIMAGE_FILES = {"bf16": torch.bfloat16, "fp8_e4m3fn": torch.float8_e4m3fn,
+                "fp8_e5m2": torch.float8_e5m2}  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def zimage_files(tmp_path_factory):
+    from safetensors.torch import save_file
+
+    root = tmp_path_factory.mktemp("zimage")
+    pipe = build_zimage()
+    pipe.save_pretrained(root / "components")
+    weights = comfy_state_dict(pipe.transformer)
+    for name, dtype in ZIMAGE_FILES.items():
+        save_file({k: v.to(dtype) for k, v in weights.items()}, root / f"z_{name}.safetensors")
+    return root
+
+
+def make_zimage_backend(zimage_files, name="bf16", **kwargs):
+    components = str(zimage_files / "components")
+    path = zimage_files / f"z_{name}.safetensors"
+    return make_backend("zimage", path, dtype=None, zimage_components=components, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def load_zimage(zimage_files):
+    """Loaded + warmed backend per weight file, built once and shared across tests."""
+
+    @functools.cache
+    def load(name):
+        backend = make_zimage_backend(zimage_files, name)
+        backend.load()
+        backend.warmup()
+        return backend
+
+    return load
+
+
+@pytest.fixture(params=list(ZIMAGE_FILES))
+def zimage(request, load_zimage):
+    return load_zimage(request.param)
+
+
+def zimage_request(**overrides):
+    return tiny_request(**{"sampler": "flow_euler", "guidance_scale": 0.0, **overrides})
+
+
+def test_zimage_loads_with_storage_dtype_and_shared_img2img(zimage):
+    storage = ZIMAGE_FILES[zimage.model_path.stem.removeprefix("z_")]
+    # FP8 files stay FP8 in memory; norms/embedders (precision-sensitive) are BF16.
+    assert {p.dtype for p in zimage.txt2img.transformer.parameters()} == {storage, torch.bfloat16}
+    assert zimage.txt2img.text_encoder.dtype == torch.bfloat16
+    assert type(zimage.img2img).__name__ == "ZImageImg2ImgPipeline"
+    for name in ("transformer", "vae", "text_encoder"):
+        assert getattr(zimage.img2img, name) is getattr(zimage.txt2img, name)
+    label = str(storage).removeprefix("torch.")
+    assert any(f"Transformer weights: {label}" in line for line in zimage.logs)
+
+
+def test_zimage_txt2img_batch(zimage, tmp_path):
+    events = []
+    job = resolve_job(zimage_request(seed=10, num_images=2, steps=3), family="zimage")
+    result = zimage.generate(job, tmp_path, lambda f, m: events.append(m))
+    assert result.seeds == (10, 11)
+    for path in result.output_paths:
+        with Image.open(path) as img:
+            assert img.size == (SIZE, SIZE)
+    assert events[-1] == "denoising 3/3"
+
+
+def test_zimage_img2img(zimage, tmp_path):
+    src = tmp_path / "in.png"
+    Image.new("RGB", (400, 300), (200, 30, 30)).save(src)
+    (tmp_path / "out").mkdir()
+    events = []
+    req = zimage_request(input_image=src, strength=0.5, steps=4, width=64, height=80)
+    result = zimage.generate(
+        resolve_job(req, family="zimage"), tmp_path / "out", lambda f, m: events.append(m)
+    )
+    with Image.open(result.output_paths[0]) as img:
+        assert img.size == (64, 80)
+    assert events[-1] == "denoising 2/2"  # int(4 * 0.5) denoising steps
+
+
+def test_zimage_cfg_uses_negative_prompt(zimage, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    def run(neg, out):
+        req = zimage_request(guidance_scale=4.0, negative_prompt=neg)
+        return zimage.generate(resolve_job(req, family="zimage"), tmp_path / out).output_paths[0]
+
+    with Image.open(run("", "a")) as x, Image.open(run("blurry, dark", "b")) as y:
+        assert x.tobytes() != y.tobytes()
+
+
+def test_zimage_load_rejects_unsupported_checkpoint(tmp_path):
+    sd = write_safetensors(tmp_path / "sd.safetensors", {"input_blocks.0.0.weight": "F16"})
+    with pytest.raises(ValueError, match="not a Z-Image transformer"):
+        make_backend("zimage", sd, dtype=None).load()
+
+
+def test_zimage_compile_failure_falls_back(zimage_files, monkeypatch, tmp_path):
+    def explode(module, **kwargs):
+        raise RuntimeError("no compiler")
+
+    monkeypatch.setattr(torch, "compile", explode)
+    backend = make_zimage_backend(zimage_files, optimization="compile")
+    backend.load()
+    assert backend.active_optimization == "baseline"
+    assert backend.img2img.transformer is backend.txt2img.transformer
+    result = backend.generate(resolve_job(zimage_request(steps=1), family="zimage"), tmp_path)
+    assert len(result.output_paths) == 1
+
+
+def test_zimage_functional_checks(load_zimage, tmp_path):
+    from src import benchmark
+
+    backend = load_zimage("fp8_e4m3fn")
+    small = dict(steps=2, size=(SIZE, SIZE), alt_size=(SIZE + 16, SIZE), log=lambda m: None)
+    checks = benchmark.functional_checks(backend, "zimage", tmp_path, **small)
+    assert {c.name: c.detail for c in checks if not c.ok} == {}
+    names = [c.name for c in checks]
+    assert "sampler Flow Euler" in names and "weighted prompt" not in names

@@ -1,7 +1,7 @@
 # sdmodeltester
 
 A small harness for testing **Stable Diffusion 1.5 and SDXL** single-file `.safetensors`
-checkpoints from a minimal browser UI. The real runtime is a Google Colab notebook on an
+checkpoints — and **Z-Image Turbo** (BF16 or FP8 transformer files) — from a minimal browser UI. The real runtime is a Google Colab notebook on an
 NVIDIA L4: the checkpoint is loaded once, kept resident on the GPU, and driven repeatedly
 (text-to-image and image-to-image) through Colab's built-in kernel proxy.
 
@@ -81,6 +81,20 @@ Unset knobs (`--width`, `--height`, `--steps`, `--cfg`, `--sampler`, `--strength
 model family's defaults. `generate` prints output paths on stdout and progress on stderr.
 Exit codes: 0 success, 1 runtime/load failure (or `doctor` found a missing required
 capability), 2 invalid arguments or request.
+
+### Z-Image Turbo (`--model-family zimage`)
+
+The `.safetensors` file is only the transformer: a plain BF16 file (e.g. Comfy-Org's
+`z_image_turbo_bf16.safetensors`, 11.5 GiB) or a plain FP8 one (e.g. drbaph's
+`z_image_turbo_fp8_e4m3fn.safetensors`, 5.7 GiB; kept in FP8 on the GPU, computed in BF16).
+The text encoder (Qwen3-4B) and VAE are downloaded from `Tongyi-MAI/Z-Image-Turbo` on first
+load (~7.7 GiB). Defaults: 1024², 9 steps, CFG 0, sampler `flow_euler`; `(text:1.2)` weights are
+ignored; sizes are multiples of 16. Scaled-FP8 / int8 / NVFP4 files are rejected —
+`doctor --model-family zimage --model <file>` checks a file before loading.
+
+```bash
+python -m src.cli serve --model-family zimage --model models/z_image_turbo_fp8_e4m3fn.safetensors
+```
 
 ## Run on Colab (L4)
 

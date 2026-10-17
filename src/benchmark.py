@@ -20,8 +20,7 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from src.backend import (
-    FAMILY_DEFAULTS,
-    SAMPLER_IDS,
+    FAMILIES,
     SAMPLER_LABELS,
     Backend,
     GenerationRequest,
@@ -29,7 +28,8 @@ from src.backend import (
     resolve_job,
 )
 
-ALT_SIZES = {"sd15": (768, 512), "sdxl": (896, 1152)}  # "first run at a new resolution"
+# "first run at a new resolution"
+ALT_SIZES = {"sd15": (768, 512), "sdxl": (896, 1152), "zimage": (896, 1152)}
 MIN_SPEEDUP = 0.05  # a compiled profile must beat baseline by this much to be recommended
 BLACK_THRESHOLD = 8  # max channel value at or below this => "black image" (fp16 VAE NaNs)
 
@@ -38,8 +38,8 @@ class Runner:
     """Builds requests from family defaults and times ``backend.generate``."""
 
     def __init__(self, backend: Backend, family: str, output_dir: Path, steps=None, size=None):
-        d = FAMILY_DEFAULTS[family]
-        self.backend, self.output_dir = backend, output_dir
+        d = FAMILIES[family].defaults
+        self.backend, self.output_dir, self.family = backend, output_dir, family
         self.defaults = dict(
             prompt="a photo of a red fox in a snowy forest, detailed",
             negative_prompt="blurry, lowres",
@@ -55,7 +55,8 @@ class Runner:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self, **overrides: Any) -> tuple[GenerationResult, float]:
-        job = resolve_job(GenerationRequest(**{**self.defaults, **overrides}), next(self.job_ids))
+        request = GenerationRequest(**{**self.defaults, **overrides})
+        job = resolve_job(request, next(self.job_ids), family=self.family)
         started = time.perf_counter()
         result = self.backend.generate(job, self.output_dir)
         return result, time.perf_counter() - started
@@ -118,7 +119,7 @@ def benchmark_profile(
     alt_w, alt_h = alt_size or ALT_SIZES[family]
     for which in ("first", "second"):
         timed(f"new_size_{which}", lambda: runner.run(width=alt_w, height=alt_h))
-    strength = FAMILY_DEFAULTS[family].strength
+    strength = FAMILIES[family].defaults.strength
     for which in ("first", "second"):
         timed(f"img2img_{which}", lambda: runner.run(input_image=first, strength=strength))
 
@@ -180,7 +181,7 @@ def functional_checks(
 ) -> list[Check]:
     """Run the functional matrix on a *loaded* backend; failures are recorded, not raised."""
     r = Runner(backend, family, output_dir, steps, size)
-    d = FAMILY_DEFAULTS[family]
+    d = FAMILIES[family].defaults
     alt_w, alt_h = alt_size or ALT_SIZES[family]
     first: list[Path] = []
 
@@ -248,20 +249,23 @@ def functional_checks(
         )
 
     colors = ("red", "white", "black")
+    weights = FAMILIES[family].prompt_weights
+    red = "a (red:1.4) fox" if weights else "a red fox"  # stripped at enqueue otherwise
     matrix = [
         ("txt2img x1", lambda: txt2img(1)),
         ("txt2img x10", lambda: txt2img(10)),
         ("img2img x1", lambda: img2img(1)),
         ("img2img x10", lambda: img2img(10)),
-        *[(f"sampler {SAMPLER_LABELS[s]}", lambda s=s: sampler(s)) for s in SAMPLER_IDS],
+        *[(f"sampler {SAMPLER_LABELS[s]}", lambda s=s: sampler(s))
+          for s in FAMILIES[family].samplers],
         ("seed -1 random per image", random_seeds),
         ("fixed seed reproducible", reproducible),
         ("batch invariance", batch_invariance),
-        ("weighted prompt", weighted),
+        *([("weighted prompt", weighted)] if weights else []),
         ("dynamic prompt", lambda: dynamic("a {red | white | black} fox",
                                            {f"a {c} fox" for c in colors}, 4)),
         ("dynamic + weighted", lambda: dynamic("a {(red:1.4) | white} fox",
-                                               {"a (red:1.4) fox", "a white fox"}, 2)),
+                                               {red, "a white fox"}, 2)),
         ("non-square", non_square),
         ("repeated singles, no reload", no_reload),
     ]  # fmt: skip

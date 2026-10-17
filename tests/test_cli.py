@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ from PIL import Image
 
 import src.cli as cli
 from src.backend import DiffusersBackend, MockBackend
+from tests.test_request import ZKEY, write_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -289,3 +291,24 @@ def test_doctor_checkpoint_checks(gpu_env, tmp_path):
     bad.write_bytes(b"x")
     code, out, _ = run_cli(["doctor", "--model", str(bad)])
     assert code == 1 and any(".safetensors" in line for line in out)
+
+
+def test_doctor_zimage_checks(gpu_env, tmp_path, monkeypatch):
+    gpu_env()
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace(ZImagePipeline=object))
+    fp8 = write_safetensors(tmp_path / "z.safetensors", {ZKEY: "F8_E4M3"})
+    checks = by_name(cli.collect_diagnostics(mock=False, model=fp8, family="zimage"))
+    assert checks["Z-Image pipeline"].status == "ok"
+    assert checks["Z-Image weights"].value == "float8_e4m3fn storage, bfloat16 compute"
+    assert not [c for c in checks.values() if c.status == "fail"]
+
+    scaled = write_safetensors(
+        tmp_path / "s.safetensors", {ZKEY: "F8_E4M3", "w._weight_scale": "F32"}
+    )
+    checks = by_name(cli.collect_diagnostics(mock=False, model=scaled, family="zimage"))
+    assert checks["Z-Image weights"].status == "fail"
+
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace())  # too old: no Z-Image
+    checks = by_name(cli.collect_diagnostics(mock=False, family="zimage"))
+    assert checks["Z-Image pipeline"].status == "fail"
+    assert "Z-Image weights" not in by_name(cli.collect_diagnostics(mock=True, model=fp8))

@@ -182,6 +182,24 @@ def test_enqueue_logs_corrections_and_dynamic_prompts(env):
     assert sum(t.startswith("Job 1: image ") for t in texts) == 2
 
 
+def test_zimage_config_and_family_rules(tmp_path):
+    state = ServerState(MockBackend("zimage"), tmp_path / "in", tmp_path / "out", echo=False)
+    client = create_app(state).test_client()
+    state.start()
+    try:
+        config = client.get("/api/config").get_json()
+        assert config["samplers"] == [{"id": "flow_euler", "label": "Flow Euler"}]
+        assert config["defaults"]["steps"] == 9 and config["defaults"]["guidance_scale"] == 0.0
+        wait_until(lambda: state.backend_state == "ready")
+        assert "not available for zimage" in queue(client, sampler="euler").get_json()["error"]
+        assert queue(client, sampler="flow_euler", prompt="a (red:1.2) cat").status_code == 200
+        wait_until(lambda: state.latest_completed is not None)
+        texts = [entry["text"] for entry in state.log_since(0)]
+        assert "Job 2: prompt weights like (text:1.2) are ignored for zimage" in texts
+    finally:
+        state.stop()
+
+
 @pytest.mark.parametrize(
     ("body", "fragment"),
     [

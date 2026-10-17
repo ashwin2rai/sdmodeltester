@@ -25,7 +25,7 @@ def backend():
 
 
 def run(backend, tmp_path, progress=None, job_id=1, **overrides):
-    job = resolve_job(make_request(**overrides), job_id=job_id)
+    job = resolve_job(make_request(**overrides), job_id=job_id, family="sd15")
     return job, backend.generate(job, tmp_path, progress)
 
 
@@ -52,7 +52,7 @@ def test_fail_load_raises():
 
 
 def test_generate_before_load_fails(tmp_path):
-    job = resolve_job(make_request())
+    job = resolve_job(make_request(), family="sd15")
     with pytest.raises(GenerationError):
         MockBackend("sd15").generate(job, tmp_path)
 
@@ -208,7 +208,7 @@ def test_oom_fallback_halves_and_remembers(tmp_path):
 def test_mid_job_failure_reports_completed_files(tmp_path):
     b = MockBackend("sd15", fail_after_images=3)
     b.load()
-    job = resolve_job(make_request(num_images=5, seed=1))
+    job = resolve_job(make_request(num_images=5, seed=1), family="sd15")
     with pytest.raises(GenerationError) as info:
         b.generate(job, tmp_path)
     assert len(info.value.completed_paths) == 3

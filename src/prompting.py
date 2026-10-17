@@ -20,7 +20,8 @@ implemented here (A1111 "original" emphasis: scale token embeddings by weight, t
 restore the chunk mean) rather than through a third-party helper, so the Colab
 dependency surface stays at diffusers/transformers. Prompts longer than 75 tokens are
 split into 77-token chunks whose embeddings are concatenated. Only the
-``encode_prompt_batch`` function touches torch, and it imports it lazily.
+``encode_prompt_batch`` function touches torch, and it imports it lazily. Z-Image uses an
+LLM text encoder, so its prompts get the weights stripped instead (``strip_weights``).
 """
 
 from __future__ import annotations
@@ -139,6 +140,14 @@ def parse_weighted(text: str) -> list[tuple[str, float]]:
         pos = match.end()
     add(masked[pos:], 1.0)
     return runs
+
+
+def strip_weights(text: str) -> str:
+    """Plain text of a weighted prompt: ``"a (red:1.2) cat"`` -> ``"a red cat"``.
+
+    For text encoders where A1111-style weights don't apply (Z-Image's Qwen3 LLM).
+    """
+    return "".join(chunk for chunk, _ in parse_weighted(text))
 
 
 def weighted_token_ids(

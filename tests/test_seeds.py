@@ -41,7 +41,7 @@ def test_explicit_seed_sequence():
 
 
 def test_job_resolves_seeds_and_prompts_per_image():
-    job = resolve_job(make_request(seed=123, num_images=4), job_id=7)
+    job = resolve_job(make_request(seed=123, num_images=4), job_id=7, family="sd15")
     assert job.job_id == 7
     assert job.seeds == (123, 124, 125, 126)
     assert [img.index for img in job.images] == [0, 1, 2, 3]
@@ -50,19 +50,19 @@ def test_job_resolves_seeds_and_prompts_per_image():
 
 
 def test_same_explicit_job_reproduces_dynamic_choices():
-    a = resolve_job(make_request(seed=123, num_images=10))
-    b = resolve_job(make_request(seed=123, num_images=10))
+    a = resolve_job(make_request(seed=123, num_images=10), family="sd15")
+    b = resolve_job(make_request(seed=123, num_images=10), family="sd15")
     assert a.images == b.images
 
 
 def test_image_choice_depends_only_on_its_seed():
     # Image with seed 124 resolves the same whether it is first or second in a job.
-    second = resolve_job(make_request(seed=123, num_images=2)).images[1]
-    first = resolve_job(make_request(seed=124, num_images=1)).images[0]
+    second = resolve_job(make_request(seed=123, num_images=2), family="sd15").images[1]
+    first = resolve_job(make_request(seed=124, num_images=1), family="sd15").images[0]
     assert (second.prompt, second.negative_prompt) == (first.prompt, first.negative_prompt)
 
 
 def test_random_job_returns_concrete_seeds():
-    job = resolve_job(make_request(seed=-1, num_images=10))
+    job = resolve_job(make_request(seed=-1, num_images=10), family="sd15")
     assert -1 not in job.seeds
     assert len(set(job.seeds)) == 10

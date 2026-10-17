@@ -1,6 +1,6 @@
 """Command-line interface: ``doctor``, ``generate``, ``serve``, ``benchmark``.
 
-    python -m src.cli doctor [--mock] [--model PATH --model-family sd15|sdxl] [--compile-check]
+    python -m src.cli doctor [--mock] [--model PATH --model-family FAMILY] [--compile-check]
     python -m src.cli generate --model-family sdxl --model models/x.safetensors --prompt "..."
     python -m src.cli generate --mock --model-family sd15 --prompt "a {white | black} cat"
     python -m src.cli serve --model-family sdxl --model models/x.safetensors --port 8000
@@ -27,7 +27,7 @@ from typing import Any
 
 from src.backend import (
     DEFAULT_OPTIMIZATION,
-    FAMILY_DEFAULTS,
+    FAMILIES,
     MODEL_FAMILIES,
     OPTIMIZATION_PROFILES,
     SAMPLER_IDS,
@@ -40,6 +40,7 @@ from src.backend import (
     configure_cuda_allocator,
     describe_request,
     resolve_job,
+    zimage_storage_dtype,
 )
 
 EXIT_OK, EXIT_FAILURE, EXIT_USAGE = 0, 1, 2
@@ -68,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--mock", action="store_true", help="placeholder backend: no GPU/torch")
         if backend:
             p.add_argument("--device", default="cuda", help=argparse.SUPPRESS)
-            p.add_argument("--dtype", default="float16", help=argparse.SUPPRESS)
+            p.add_argument("--dtype", help=argparse.SUPPRESS)  # default: per family
             p.add_argument(
                 "--optimization", choices=OPTIMIZATION_PROFILES, default=DEFAULT_OPTIMIZATION
             )
@@ -131,7 +132,7 @@ def build_backend(args: argparse.Namespace, log: Printer, **mock_options: float)
 
 def build_request(args: argparse.Namespace) -> tuple[GenerationRequest, list[str]]:
     """Fill unset knobs from family defaults; returns the request and CLI notes."""
-    d = FAMILY_DEFAULTS[args.model_family]
+    d = FAMILIES[args.model_family].defaults
     notes, strength = [], None
     if args.image is not None:
         if not args.image.is_file():
@@ -166,7 +167,7 @@ def build_request(args: argparse.Namespace) -> tuple[GenerationRequest, list[str
 
 def cmd_generate(args: argparse.Namespace, out: Printer, err: Printer) -> int:
     request, notes = build_request(args)
-    job = resolve_job(request, job_id=1)
+    job = resolve_job(request, job_id=1, family=args.model_family)
     for note in (*notes, *job.corrections):
         err(f"Note: {note}")
 
@@ -373,6 +374,11 @@ def collect_diagnostics(
         checks.append(Check("PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "(unset)")))
     if family is not None:
         checks.append(Check("model family", family, "ok"))
+    if family == "zimage" and not mock:
+        checks.append(
+            _probe("Z-Image pipeline", lambda: importlib.import_module("diffusers").ZImagePipeline,
+                   "fail", "needs diffusers >= 0.36")
+        )  # fmt: skip
     if model is not None:
         ok = model.is_file() and model.suffix.lower() == ".safetensors"
         exists = "yes" if model.is_file() else "no"
@@ -380,7 +386,21 @@ def collect_diagnostics(
         checks.append(
             Check("checkpoint exists", f"{exists} ({model})", "ok" if ok else "fail", hint)
         )
+        if ok and family == "zimage":
+            checks.append(_zimage_weights(model))
     return checks
+
+
+def _zimage_weights(model: Path) -> Check:
+    try:
+        storage = zimage_storage_dtype(model)
+    except ValueError as exc:
+        return Check(
+            "Z-Image weights", str(exc), "fail", "use a plain BF16 or FP8 transformer file"
+        )
+    return Check(
+        "Z-Image weights", f"{storage} storage, bfloat16 compute" if storage else "bfloat16"
+    )
 
 
 def format_checks(checks: Sequence[Check]) -> list[str]:

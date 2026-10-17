@@ -6,7 +6,8 @@ development are folded in and marked **(owner)**. Progress and learnings: `statu
 ## 1. Purpose
 
 A deliberately small harness for testing **SD 1.5 and SDXL single-file `.safetensors`
-checkpoints** on a **Google Colab NVIDIA L4**. One checkpoint is loaded once, kept resident on
+checkpoints** — and **Z-Image Turbo** transformer files (BF16 or plain FP8) — on a **Google
+Colab NVIDIA L4**. One checkpoint is loaded once, kept resident on
 the GPU, and driven from a minimal browser UI exposed through Colab's built-in kernel proxy.
 The backend exists to enable that loop, not as a general inference service.
 
@@ -16,14 +17,15 @@ Inspired by `videomodeltests` (https://github.com/ashwin2rai/videomodeltests) bu
 
 ## 2. Scope
 
-**In V1:** one `.safetensors` checkpoint per session with an explicit family (`sd15` | `sdxl`);
+**In V1:** one `.safetensors` checkpoint per session with an explicit family (`sd15` | `sdxl` |
+`zimage`, §4a);
 txt2img and img2img; real Diffusers backend + mock backend; CLI (`doctor`, `generate`, `serve`,
-`benchmark`); one GPU worker queue; batching (1–10 images) with OOM fallback; six samplers;
+`benchmark`); one GPU worker queue; batching (1–10 images) with OOM fallback; six SD samplers (+ flow-match Euler for Z-Image);
 `(text:1.2)` weights; one-level `{a | b}` alternatives; negative prompts; seed −1 / sequential
 seeds; minimal UI with input upload and output reuse; metadata-free PNGs; clear queue; best-
 effort secure clear-all; Colab notebook (built last); HF + Civitai downloads; built-in proxy only.
 
-**Out:** GGUF, Diffusers folders, SD 2.x/SD3/Flux, model switching or multiple models, LoRA,
+**Out:** GGUF, Diffusers folders (except Z-Image's own components, §4a), SD 2.x/SD3/Flux, model switching or multiple models, LoRA,
 textual-inversion UI, ControlNet, inpainting, upscaling, SDXL refiner, auth, WebSockets/SSE,
 multiple GPU workers, mid-generation cancel, queue editing, ngrok/Cloudflare, Docker/RunPod,
 generation database, sidecar JSON, prompt metadata in PNGs, family auto-detection.
@@ -64,10 +66,37 @@ generation database, sidecar JSON, prompt metadata in PNGs, family auto-detectio
 Hidden in V1: clip skip (None), SDXL second prompts (reuse main), SDXL size conditioning
 (pipeline defaults), refiner, offload, VAE slicing/tiling.
 
+**`from_pipe` dtype:** diffusers' `from_pipe` casts every shared module to its `dtype`
+argument, which defaults to float32 — img2img is always built with the pipeline's own dtype
+(found 2026-10-17: before that fix, SD/SDXL silently ran in FP32 after load).
+
+## 4a. Z-Image Turbo (`zimage`)
+
+- 6B single-stream DiT + Qwen3-4B text encoder + 16-channel VAE; **BF16** (not FP16);
+  `ZImagePipeline` / `ZImageImg2ImgPipeline` (diffusers ≥ 0.36; Colab has 0.40).
+- The `.safetensors` file holds **only the transformer**, in the ComfyUI layout the Comfy-Org
+  and community releases use; it is loaded with `ZImageTransformer2DModel.from_single_file`.
+  Text encoder, VAE, tokenizer, scheduler and configs come from `Tongyi-MAI/Z-Image-Turbo`
+  on the Hub (~7.7 GiB, cached; not gated).
+- Supported weights, detected from the file header: BF16 (also F16/F32, loaded as BF16) and
+  **plain FP8** (`F8_E4M3` / `F8_E5M2`: every tensor cast straight to FP8, same names as BF16).
+  FP8 stays FP8 in VRAM via `enable_layerwise_casting` (storage = the file's FP8 type, compute
+  BF16; diffusers keeps `t_embedder`/`cap_embedder`/norms in BF16). Memory saving only — not
+  faster; no torchao. Scaled-FP8 (`*_weight_scale`, `scale_weight`), int8 and NVFP4 files and
+  non-Z-Image files are rejected with a clear error (also by `doctor --model`).
+- img2img is constructed from the loaded components (not `from_pipe`, whose dtype cast would
+  undo FP8 storage).
+- Defaults: 1024×1024, **9 steps** (= 8 transformer passes), **CFG 0** (distilled; CFG > 0
+  runs a negative pass), `flow_euler`, strength 0.60. Sizes are multiples of **16**.
+- L4 estimate (unverified): BF16 ≈ 19.3 GiB resident, FP8 ≈ 13.5 GiB, ~1 s/step at 1024².
+
+
 ## 5. Samplers
 
 App-owned IDs (never Diffusers class names), each built per job from the checkpoint's scheduler
-config with explicit overrides, without reloading weights:
+config with explicit overrides, without reloading weights. Samplers are per family: SD1.5/SDXL
+get the six SD samplers, Z-Image only `flow_euler`; others are rejected at enqueue and the UI
+lists only the family's samplers:
 
 | ID | Label | Scheduler |
 |---|---|---|
@@ -77,6 +106,7 @@ config with explicit overrides, without reloading weights:
 | `euler_a` | Euler a | EulerAncestralDiscrete |
 | `heun` | Heun | HeunDiscrete (Karras off) |
 | `dpm2_karras` | DPM2 Karras | KDPM2Discrete, Karras |
+| `flow_euler` | Flow Euler | FlowMatchEulerDiscrete (Z-Image's own config, incl. shift) |
 
 ## 6. Prompts
 
@@ -93,13 +123,17 @@ Order: validate braces → choose alternatives per image → weighted embeddings
   own encoding. Long prompts use 75-token chunks; a batch with different prompts is padded to
   a common length; identical prompts are encoded once. SDXL uses both encoders' penultimate
   states + pooled output; an empty SDXL negative becomes zeros (diffusers behaviour).
+- **Z-Image**: its Qwen3 LLM encoder has no weight syntax, so weights are stripped at enqueue
+  (`(red:1.2)` → `red`, logged once per job); dynamic alternatives work as usual. The pipeline
+  encodes the plain prompts itself (chat template).
+- A negative prompt at CFG 0 is ignored by every pipeline; enqueue logs a note.
 
 ## 7. Requests, seeds, inputs, outputs
 
 - Seeds: −1 → a unique random seed per image, resolved at enqueue; fixed seed `s` → `s, s+1, …`.
   One generator per image, so an image is identical alone or in a batch.
 - Limits (backend-enforced): width/height 256–2048, **rounded to the nearest multiple of 8
-  first (owner)**, UI step 64; steps 1–150; CFG 0–30; images 1–10; prompt ≤ 4000 chars; seed −1 or
+  first (owner)** (16 for Z-Image), UI step 64; steps 1–150; CFG 0–30; images 1–10; prompt ≤ 4000 chars; seed −1 or
   0..2³²−1 with no wraparound. Corrections are applied silently and logged.
 - **img2img steps (owner)**: Diffusers runs `int(steps × strength)` steps; if that is 0, raise
   steps to the minimum giving one step (A1111-like) and log it. Strength in (0, 1], ignored for
@@ -122,7 +156,7 @@ Order: validate braces → choose alternatives per image → weighted embeddings
   paths; placeholder PNGs showing family/mode/seed/prompt; configurable delays, simulated OOM
   and failures.
 - **Optimization profiles**: `baseline` (FP16 + SDPA; default until L4 benchmarks decide),
-  `compile` (channels_last UNet + `torch.compile(reduce-overhead)`), `compile-max` (+ compiled
+  `compile` (channels_last UNet — or the Z-Image transformer — + `torch.compile(reduce-overhead)`), `compile-max` (+ compiled
   VAE decode, max-autotune). Any failure — at setup or warm-up — falls back to baseline; never
   fatal. New shapes may recompile (logged); no dynamic-shape compile, nightly torch or patched
   model code.
@@ -209,8 +243,8 @@ policies apply.
   (`--group ui`). GPU-only tests carry `@pytest.mark.gpu` and are excluded by default.
 - **L4 (`benchmark`)**: per profile — cold load, compile/warm-up, warm single ×3, batch 5/10,
   a new resolution, img2img, peak VRAM, OOM limits. Functional matrix (first profile): txt2img
-  and img2img ×1/×10, all six samplers, seed −1, reproducible fixed seeds, batch invariance,
-  weighted, dynamic and combined prompts, non-square, no reload between jobs; every image is
+  and img2img ×1/×10, all of the family's samplers, seed −1, reproducible fixed seeds, batch
+  invariance, weighted (not for Z-Image), dynamic and combined prompts, non-square, no reload between jobs; every image is
   checked for black output. Report `compat/benchmark-<family>-<date>.md` + contact sheet for a
   human quality check. Default profile = fastest warm single image that stayed compiled and
   beats baseline by ≥ 5%; no arbitrary seconds-per-image target.

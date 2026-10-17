@@ -28,8 +28,8 @@ from PIL import Image
 from werkzeug.utils import secure_filename
 
 from src.backend import (
-    FAMILY_DEFAULTS,
-    SAMPLERS,
+    FAMILIES,
+    SAMPLER_LABELS,
     Backend,
     GenerationRequest,
     ResolvedGenerationJob,
@@ -189,7 +189,7 @@ class ServerState:
             if self.queue.full():
                 raise QueueFull(f"queue is full ({self.queue.maxsize} pending jobs)")
             job_id = next(self._job_ids)
-            record = JobRecord(job_id, resolve_job(req, job_id=job_id))
+            record = JobRecord(job_id, resolve_job(req, job_id=job_id, family=self.backend.family))
             self.queue.put_nowait(record)
             waiting = "" if self.backend_state == "ready" else " (waiting for model)"
         r = record.job.request
@@ -379,7 +379,7 @@ def clear_directory(directory: Path) -> int:
 def request_from_json(data: Any, family: str, inputs_dir: Path) -> GenerationRequest:
     if not isinstance(data, dict):
         raise ValidationError("request body must be a JSON object")
-    d = FAMILY_DEFAULTS[family]
+    d = FAMILIES[family].defaults
     prompt = data.get("prompt", "")
     negative = data.get("negative_prompt", "")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -441,8 +441,10 @@ def create_app(state: ServerState) -> Flask:
             {
                 "model_family": family,
                 "model_name": state.backend.model_name,
-                "defaults": dataclasses.asdict(FAMILY_DEFAULTS[family]),
-                "samplers": [{"id": sid, "label": label} for sid, label in SAMPLERS],
+                "defaults": dataclasses.asdict(FAMILIES[family].defaults),
+                "samplers": [
+                    {"id": sid, "label": SAMPLER_LABELS[sid]} for sid in FAMILIES[family].samplers
+                ],
             }
         )
 

@@ -7,6 +7,7 @@ backend (Phase 3) imports them lazily inside its methods.
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 import random
@@ -19,13 +20,13 @@ from typing import Any, Literal, Protocol, TypeVar, get_args
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from src.prompting import PromptSyntaxError, resolve_prompt_pair, validate_template
+from src.prompting import PromptSyntaxError, resolve_prompt_pair, strip_weights, validate_template
 
 # ---------------------------------------------------------------------------
 # Application constants
 # ---------------------------------------------------------------------------
 
-ModelFamily = Literal["sd15", "sdxl"]
+ModelFamily = Literal["sd15", "sdxl", "zimage"]
 MODEL_FAMILIES: tuple[str, ...] = get_args(ModelFamily)
 
 Mode = Literal["txt2img", "img2img"]
@@ -38,6 +39,7 @@ SAMPLERS: tuple[tuple[str, str], ...] = (
     ("euler_a", "Euler a"),
     ("heun", "Heun"),
     ("dpm2_karras", "DPM2 Karras"),
+    ("flow_euler", "Flow Euler"),
 )
 SAMPLER_IDS: tuple[str, ...] = tuple(sid for sid, _ in SAMPLERS)
 SAMPLER_LABELS: dict[str, str] = dict(SAMPLERS)
@@ -58,7 +60,11 @@ SAMPLER_SCHEDULERS: dict[str, tuple[str, dict[str, Any]]] = {
     "euler_a": ("EulerAncestralDiscreteScheduler", {}),
     "heun": ("HeunDiscreteScheduler", {"use_karras_sigmas": False}),
     "dpm2_karras": ("KDPM2DiscreteScheduler", {"use_karras_sigmas": True}),
+    # Z-Image is a flow-matching model: keep its own scheduler config (incl. shift).
+    "flow_euler": ("FlowMatchEulerDiscreteScheduler", {}),
 }
+# The SD samplers are noise-prediction schedulers; flow matching needs its own.
+_SD_SAMPLERS = tuple(sid for sid in SAMPLER_IDS if sid != "flow_euler")
 
 MAX_IMAGES = 10
 MIN_DIMENSION = 256
@@ -83,9 +89,38 @@ class FamilyDefaults:
     strength: float
 
 
-FAMILY_DEFAULTS: dict[str, FamilyDefaults] = {
-    "sd15": FamilyDefaults(512, 512, 25, 7.5, "dpmpp_2m_sde_karras", -1, 1, 0.6),
-    "sdxl": FamilyDefaults(1024, 1024, 25, 5.0, "dpmpp_2m_sde_karras", -1, 1, 0.6),
+@dataclass(frozen=True)
+class FamilySpec:
+    """Everything that differs per model family, apart from how its pipeline is loaded."""
+
+    defaults: FamilyDefaults  # served as-is by /api/config
+    samplers: tuple[str, ...]
+    dtype: str = "float16"
+    dimension_multiple: int = DIMENSION_MULTIPLE
+    # False: the text encoder has no (text:1.2) syntax, so weights are stripped at enqueue
+    # and the pipeline encodes the plain prompts itself.
+    prompt_weights: bool = True
+    denoiser: str = "unet"
+
+
+FAMILIES: dict[str, FamilySpec] = {
+    "sd15": FamilySpec(
+        FamilyDefaults(512, 512, 25, 7.5, "dpmpp_2m_sde_karras", -1, 1, 0.6), _SD_SAMPLERS
+    ),
+    "sdxl": FamilySpec(
+        FamilyDefaults(1024, 1024, 25, 5.0, "dpmpp_2m_sde_karras", -1, 1, 0.6), _SD_SAMPLERS
+    ),
+    # Turbo: 9 steps = 8 transformer passes; distilled, so guidance off (0 = no CFG pass).
+    # Sizes: VAE factor 8 x patch 2 (the pipeline silently floors anything else); Qwen3 LLM
+    # text encoder; BF16 (FP16 overflows).
+    "zimage": FamilySpec(
+        FamilyDefaults(1024, 1024, 9, 0.0, "flow_euler", -1, 1, 0.6),
+        ("flow_euler",),
+        dtype="bfloat16",
+        dimension_multiple=16,
+        prompt_weights=False,
+        denoiser="transformer",
+    ),
 }
 
 
@@ -197,10 +232,9 @@ def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def round_dimension(value: int) -> int:
-    """Nearest multiple of 8, ties rounding up (516 -> 520, 1001 -> 1000)."""
-    half = DIMENSION_MULTIPLE // 2
-    return (value + half) // DIMENSION_MULTIPLE * DIMENSION_MULTIPLE
+def round_dimension(value: int, multiple: int = DIMENSION_MULTIPLE) -> int:
+    """Nearest multiple of 8 (or ``multiple``), ties rounding up (516 -> 520, 1001 -> 1000)."""
+    return (value + multiple // 2) // multiple * multiple
 
 
 def min_img2img_steps(strength: float) -> int:
@@ -211,10 +245,13 @@ def min_img2img_steps(strength: float) -> int:
     return steps
 
 
-def normalize_request(req: GenerationRequest) -> tuple[GenerationRequest, tuple[str, ...]]:
+def normalize_request(
+    req: GenerationRequest, family: ModelFamily
+) -> tuple[GenerationRequest, tuple[str, ...]]:
     """Apply silent backend corrections; return the corrected request and log notes.
 
-    - width/height are rounded to the nearest multiple of 8 (range is checked afterwards);
+    - width/height are rounded to the nearest multiple of 8 (16 for Z-Image; range is
+      checked afterwards);
     - img2img steps are raised so at least one denoising step runs (Diffusers runs
       ``int(steps * strength)`` steps and errors on zero).
 
@@ -222,12 +259,13 @@ def normalize_request(req: GenerationRequest) -> tuple[GenerationRequest, tuple[
     """
     changes: dict[str, int] = {}
     notes: list[str] = []
+    multiple = FAMILIES[family].dimension_multiple
 
     for name in ("width", "height"):
         value = getattr(req, name)
-        if _is_int(value) and value % DIMENSION_MULTIPLE:
-            changes[name] = round_dimension(value)
-            notes.append(f"{name} {value} rounded to {changes[name]} (multiple of 8)")
+        if _is_int(value) and value % multiple:
+            changes[name] = round_dimension(value, multiple)
+            notes.append(f"{name} {value} rounded to {changes[name]} (multiple of {multiple})")
 
     if (
         req.input_image is not None
@@ -247,11 +285,12 @@ def normalize_request(req: GenerationRequest) -> tuple[GenerationRequest, tuple[
     return (replace(req, **changes) if changes else req), tuple(notes)
 
 
-def validate_request(req: GenerationRequest) -> None:
-    """Backend-side validation; raises ValidationError with a user-facing message.
+def validate_request(req: GenerationRequest, family: ModelFamily) -> None:
+    """Backend-side validation for ``family``; raises ValidationError with a user-facing message.
 
     Expects a request that has already been through ``normalize_request``.
     """
+    spec = FAMILIES[family]
     for name in ("prompt", "negative_prompt"):
         text = getattr(req, name)
         if not isinstance(text, str):
@@ -269,8 +308,8 @@ def validate_request(req: GenerationRequest) -> None:
             raise ValidationError(f"{name} must be an integer")
         if not MIN_DIMENSION <= value <= MAX_DIMENSION:
             raise ValidationError(f"{name} must be between {MIN_DIMENSION} and {MAX_DIMENSION}")
-        if value % DIMENSION_MULTIPLE:
-            raise ValidationError(f"{name} must be a multiple of {DIMENSION_MULTIPLE}")
+        if value % spec.dimension_multiple:
+            raise ValidationError(f"{name} must be a multiple of {spec.dimension_multiple}")
 
     if not _is_int(req.steps) or not 1 <= req.steps <= MAX_STEPS:
         raise ValidationError(f"steps must be an integer between 1 and {MAX_STEPS}")
@@ -278,8 +317,8 @@ def validate_request(req: GenerationRequest) -> None:
     if not _is_number(req.guidance_scale) or not 0 <= req.guidance_scale <= MAX_GUIDANCE:
         raise ValidationError(f"guidance scale must be between 0 and {MAX_GUIDANCE}")
 
-    if req.sampler not in SAMPLER_IDS:
-        raise ValidationError(f"unknown sampler {req.sampler!r}")
+    if req.sampler not in spec.samplers:
+        raise ValidationError(f"sampler {req.sampler!r} is not available for {family}")
 
     if not _is_int(req.num_images) or not 1 <= req.num_images <= MAX_IMAGES:
         raise ValidationError(f"image count must be between 1 and {MAX_IMAGES}")
@@ -321,19 +360,30 @@ def resolve_seeds(seed: int, count: int, rng: random.Random | None = None) -> tu
 
 
 def resolve_job(
-    req: GenerationRequest, job_id: int = 0, rng: random.Random | None = None
+    req: GenerationRequest,
+    job_id: int = 0,
+    rng: random.Random | None = None,
+    *,
+    family: ModelFamily,
 ) -> ResolvedGenerationJob:
     """Normalize, validate, and resolve concrete seeds and dynamic prompts.
 
     Done at enqueue time. Each image's dynamic choices come from its own seed, so a
     fixed-seed job (123, 124, ...) resolves the same prompts every time it is re-run.
     """
-    req, corrections = normalize_request(req)
-    validate_request(req)
+    req, corrections = normalize_request(req, family)
+    validate_request(req, family)
+    weights = FAMILIES[family].prompt_weights
     images = []
     for index, seed in enumerate(resolve_seeds(req.seed, req.num_images, rng)):
-        prompt, negative = resolve_prompt_pair(req.prompt, req.negative_prompt, seed)
-        images.append(ResolvedImageSpec(index, seed, prompt, negative))
+        prompts = resolve_prompt_pair(req.prompt, req.negative_prompt, seed)
+        if not weights:
+            prompts = tuple(map(strip_weights, prompts))
+        images.append(ResolvedImageSpec(index, seed, *prompts))
+    if not weights and any(strip_weights(t) != t for t in (req.prompt, req.negative_prompt)):
+        corrections += (f"prompt weights like (text:1.2) are ignored for {family}",)
+    if req.negative_prompt.strip() and req.guidance_scale == 0:
+        corrections += ("negative prompt is ignored at CFG 0",)
     return ResolvedGenerationJob(
         request=req, images=tuple(images), job_id=job_id, corrections=corrections
     )
@@ -649,6 +699,45 @@ OPTIMIZATION_PROFILES: tuple[str, ...] = ("baseline", "compile", "compile-max")
 DEFAULT_OPTIMIZATION = "baseline"  # until Phase 8 L4 benchmarks pick a winner
 WARMUP_STEPS = 3
 
+# Z-Image single files hold only the transformer; text encoder (Qwen3-4B), VAE, tokenizer,
+# scheduler and configs come from the official Diffusers repo (~7.7 GiB, cached by the Hub).
+ZIMAGE_COMPONENTS = "Tongyi-MAI/Z-Image-Turbo"
+_ZIMAGE_KEYS = (
+    "layers.0.adaLN_modulation.0.weight",
+    "model.diffusion_model.layers.0.adaLN_modulation.0.weight",
+)
+_FP8_DTYPES = {"F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2"}
+
+
+def read_safetensors_header(path: Path) -> dict[str, Any]:
+    """Tensor name -> {dtype, shape, ...} from a .safetensors header (no tensor data read)."""
+    with open(path, "rb") as f:
+        size = int.from_bytes(f.read(8), "little")
+        if not 2 <= size <= 100 * 2**20:
+            raise ValueError(f"{path.name} is not a valid .safetensors file")
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    return header
+
+
+def zimage_storage_dtype(path: Path) -> str | None:
+    """FP8 storage dtype of a Z-Image transformer file (``None`` = BF16/FP16/FP32 weights).
+
+    Only plain checkpoints are supported: weights cast straight to FP8, same names as the
+    BF16 release. Scaled-FP8 / int8 / NVFP4 files need their own loaders and are rejected.
+    """
+    header = read_safetensors_header(path)
+    if not any(key in header for key in _ZIMAGE_KEYS):
+        raise ValueError(f"{path.name} is not a Z-Image transformer checkpoint")
+    if any("scale" in key.rsplit(".", 1)[-1] for key in header):
+        raise ValueError(f"{path.name} is a scaled/quantized checkpoint; use a plain BF16/FP8 file")
+    dtypes = {info["dtype"] for info in header.values()}
+    fp8 = {_FP8_DTYPES[d] for d in dtypes if d in _FP8_DTYPES}
+    unsupported = dtypes - set(_FP8_DTYPES) - {"BF16", "F16", "F32"}
+    if unsupported or len(fp8) > 1:
+        raise ValueError(f"{path.name}: unsupported weight types {', '.join(sorted(dtypes))}")
+    return fp8.pop() if fp8 else None
+
 
 def configure_cuda_allocator() -> None:
     """Set the allocator config; only effective if called before torch is imported."""
@@ -664,10 +753,12 @@ def make_scheduler(sampler: str, base_config: Any) -> Any:
 
 
 class DiffusersBackend(_BatchedBackend):
-    """Single-file SD1.5/SDXL checkpoint kept resident on the GPU.
+    """Single-file SD1.5/SDXL checkpoint or Z-Image transformer kept resident on the GPU.
 
     ``pipeline_loader`` replaces ``from_single_file`` (tests inject tiny random
-    pipelines); ``device``/``dtype`` default to the Colab L4 fast path.
+    pipelines); ``device``/``dtype`` default to the Colab L4 fast path (dtype per family).
+    ``zimage_components`` is where Z-Image's other components come from (a Hub repo id
+    or a local Diffusers folder).
     """
 
     def __init__(
@@ -676,12 +767,13 @@ class DiffusersBackend(_BatchedBackend):
         model_path: Path | str,
         *,
         device: str = "cuda",
-        dtype: str = "float16",
+        dtype: str | None = None,
         optimization: str = DEFAULT_OPTIMIZATION,
         warmup_steps: int = WARMUP_STEPS,
         warmup_size: tuple[int, int] | None = None,
         log: Callable[[str], None] | None = None,
         pipeline_loader: Callable[[], Any] | None = None,
+        zimage_components: str = ZIMAGE_COMPONENTS,
     ) -> None:
         if optimization not in OPTIMIZATION_PROFILES:
             raise ValueError(f"optimization must be one of {', '.join(OPTIMIZATION_PROFILES)}")
@@ -689,12 +781,13 @@ class DiffusersBackend(_BatchedBackend):
         self.model_path = Path(model_path)
         self.model_name = self.model_path.name
         self.device = device
-        self.dtype_name = dtype
+        self.spec = FAMILIES[self.family]
+        self.dtype_name = dtype or self.spec.dtype
+        self.zimage_components = zimage_components
         self.optimization = optimization
         self.active_optimization = "baseline"
         self.warmup_steps = warmup_steps
-        defaults = FAMILY_DEFAULTS[self.family]
-        self.warmup_size = warmup_size or (defaults.width, defaults.height)
+        self.warmup_size = warmup_size or (self.spec.defaults.width, self.spec.defaults.height)
         self.log = log or (lambda message: None)
         self.pipeline_loader = pipeline_loader
         self.batcher = MicroBatcher()
@@ -741,21 +834,55 @@ class DiffusersBackend(_BatchedBackend):
                 safety_checker=None,
                 requires_safety_checker=False,
             )
-        else:
+        elif self.family == "sdxl":
             pipe = diffusers.StableDiffusionXLPipeline.from_single_file(
                 str(self.model_path), torch_dtype=dtype, add_watermarker=False
             )
+        else:
+            pipe = self._load_zimage(dtype)
         return pipe.to(self.device)
 
+    def _load_zimage(self, dtype: Any) -> Any:
+        import diffusers
+        import torch
+
+        storage = zimage_storage_dtype(self.model_path)
+        transformer = diffusers.ZImageTransformer2DModel.from_single_file(
+            str(self.model_path),
+            config=self.zimage_components,
+            subfolder="transformer",
+            torch_dtype=dtype,
+        )
+        if storage:
+            # Keep weights in FP8 (half the VRAM), upcast per layer to compute in BF16. Exact
+            # for a plain FP8 file; saves memory, not time. Precision-sensitive layers stay BF16.
+            transformer.enable_layerwise_casting(
+                storage_dtype=getattr(torch, storage), compute_dtype=dtype
+            )
+        self.log(
+            f"Transformer weights: {storage or self.dtype_name}; loading text encoder + VAE "
+            f"from {self.zimage_components} (first run downloads ~7.7 GiB)"
+        )
+        return diffusers.ZImagePipeline.from_pretrained(
+            self.zimage_components, transformer=transformer, torch_dtype=dtype
+        )
+
     def _img2img_from(self, pipe: Any) -> Any:
-        """Img2img pipeline sharing the already-loaded components (no second weight copy)."""
+        """Img2img pipeline sharing the already-loaded components (no second weight copy).
+
+        ``from_pipe`` casts every shared module to its ``dtype`` argument (default float32!),
+        so it gets the pipeline's own dtype. Z-Image is built from the components directly:
+        any cast would also undo FP8 storage.
+        """
         import diffusers
 
         if self.family == "sd15":
             return diffusers.StableDiffusionImg2ImgPipeline.from_pipe(
-                pipe, safety_checker=None, requires_safety_checker=False
+                pipe, safety_checker=None, requires_safety_checker=False, torch_dtype=pipe.dtype
             )
-        img2img = diffusers.StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
+        if self.family == "zimage":
+            return diffusers.ZImageImg2ImgPipeline(**pipe.components)
+        img2img = diffusers.StableDiffusionXLImg2ImgPipeline.from_pipe(pipe, torch_dtype=pipe.dtype)
         img2img.watermark = None  # SPEC §4: never watermark
         return img2img
 
@@ -769,11 +896,14 @@ class DiffusersBackend(_BatchedBackend):
         """channels_last + torch.compile; any failure falls back to the baseline."""
         import torch
 
-        self._original_modules = {"unet": self.txt2img.unet, "vae": self.txt2img.vae}
+        name = self.spec.denoiser
+        self._original_modules = {name: getattr(self.txt2img, name), "vae": self.txt2img.vae}
         try:
             mode = "max-autotune" if profile == "compile-max" else "reduce-overhead"
-            unet = self.txt2img.unet.to(memory_format=torch.channels_last)
-            self._set_module("unet", torch.compile(unet, mode=mode, fullgraph=True))
+            denoiser = self._original_modules[name]
+            if name == "unet":
+                denoiser = denoiser.to(memory_format=torch.channels_last)
+            self._set_module(name, torch.compile(denoiser, mode=mode, fullgraph=True))
             if profile == "compile-max":
                 vae = self.txt2img.vae.to(memory_format=torch.channels_last)
                 vae.decode = torch.compile(vae.decode, mode=mode, fullgraph=True)
@@ -826,7 +956,7 @@ class DiffusersBackend(_BatchedBackend):
         self.log(f"Warm-up complete in {time.monotonic() - started:.1f}s")
 
     def _warmup_once(self) -> None:
-        d = FAMILY_DEFAULTS[self.family]
+        d = self.spec.defaults
         width, height = self.warmup_size
         req = GenerationRequest(
             "warm-up", "", width, height, self.warmup_steps, d.guidance_scale,
@@ -874,12 +1004,12 @@ class DiffusersBackend(_BatchedBackend):
 
         pipe = self.txt2img if source is None else self.img2img
         pipe.scheduler = make_scheduler(req.sampler, self.base_scheduler_config)
-        embeds = encode_prompt_batch(
-            pipe,
-            self.family,
-            [spec.prompt for spec in batch],
-            [spec.negative_prompt for spec in batch],
-        )
+        prompts = [spec.prompt for spec in batch]
+        negatives = [spec.negative_prompt for spec in batch]
+        if self.spec.prompt_weights:
+            embeds = encode_prompt_batch(pipe, self.family, prompts, negatives)
+        else:  # e.g. Z-Image: Qwen3 chat-template encoding stays in the pipeline
+            embeds = {"prompt": prompts, "negative_prompt": negatives}
         # One generator per image: an image depends only on its own seed (SPEC §7).
         generators = [torch.Generator(device=self.device).manual_seed(s.seed) for s in batch]
 
