@@ -73,6 +73,15 @@ where we are, and what we learned.
 - Cell 2 now `git pull`s when rerun, so pushing a fix + rerunning cells 2 and 4 updates a live
   session.
 
+## Colab image drift (2026-10-20)
+
+- Colab now preinstalls diffusers 0.41.0 + transformers 5.20.1 (the published
+  `pip-freeze.gpu.txt` still says 0.40.0 / 5.18.0) alongside torchao 0.10.0. diffusers 0.41.0
+  imports `torchao.quantization.FqnToConfig` (newer torchao only) whenever torchao is present,
+  so `doctor` failed on the Z-Image pipeline import. Fix: `diffusers>=0.36,<0.41` (reproduced
+  and verified on CPU with torchao 0.10.0). Lift the cap once Colab's torchao has `FqnToConfig`.
+- `doctor` now reports the innermost exception (diffusers wraps import errors).
+
 ## Still unverified (needs Colab)
 
 - Z-Image on the L4 (2026-10-17, built without downloading the 7.7 GiB text encoder): real

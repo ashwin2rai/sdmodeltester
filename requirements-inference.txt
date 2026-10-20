@@ -3,7 +3,9 @@
 # Do NOT list torch here: Colab owns Python, CUDA and PyTorch.
 # Version bounds are provisional until Phase 8 L4 verification;
 # see objectives/SPEC.md §3.
-diffusers  # Z-Image needs >= 0.36 (doctor checks ZImagePipeline)
+# Z-Image needs >= 0.36. 0.41.0 imports torchao.quantization.FqnToConfig whenever torchao
+# is installed; Colab ships torchao 0.10.0, which lacks it, so every pipeline import fails.
+diffusers>=0.36,<0.41
 transformers
 accelerate
 safetensors
