@@ -318,6 +318,8 @@ def _probe(name: str, fn: Callable[[], Any], missing: str = "warn", hint: str = 
         fn()
         return Check(name, "ok", "ok")
     except Exception as exc:  # noqa: BLE001
+        while exc.__cause__ is not None:  # diffusers wraps the real import error
+            exc = exc.__cause__
         why = f"{type(exc).__name__}: {exc}".splitlines()[0][:160]
         return Check(name, f"failed ({why})", missing, hint)
 

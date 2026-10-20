@@ -312,3 +312,14 @@ def test_doctor_zimage_checks(gpu_env, tmp_path, monkeypatch):
     checks = by_name(cli.collect_diagnostics(mock=False, family="zimage"))
     assert checks["Z-Image pipeline"].status == "fail"
     assert "Z-Image weights" not in by_name(cli.collect_diagnostics(mock=True, model=fp8))
+
+
+def test_probe_reports_root_cause():
+    def wrapped():
+        try:
+            raise ImportError("cannot import name 'Qwen3Model'")
+        except ImportError as e:
+            raise RuntimeError("Failed to import x because of the following error:\n...") from e
+
+    check = cli._probe("Z-Image pipeline", wrapped, "fail")
+    assert check.value == "failed (ImportError: cannot import name 'Qwen3Model')"
