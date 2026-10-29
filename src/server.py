@@ -39,7 +39,7 @@ from src.backend import (
     resolve_job,
 )
 
-MAX_QUEUE = 5
+MAX_QUEUE = 15
 LOG_LINES = 300
 MAX_UPLOAD_BYTES = 50 * 2**20
 INPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
