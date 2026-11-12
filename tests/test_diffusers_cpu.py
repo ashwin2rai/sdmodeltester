@@ -723,7 +723,11 @@ def test_zimage_img2img(zimage, tmp_path):
     )
     with Image.open(result.output_paths[0]) as img:
         assert img.size == (64, 80)
-    assert events[-1] == "denoising 2/2"  # int(4 * 0.5) denoising steps
+    assert events[-1] == "denoising 4/4"  # continuous strength: every step runs
+    # The schedule starts at the shifted strength, not at a snapped step boundary.
+    shift = zimage.img2img.scheduler.config.shift
+    start = float(zimage.img2img.scheduler.sigmas[0])
+    assert start == pytest.approx(shift * 0.5 / (1 + (shift - 1) * 0.5), abs=1e-4)
 
 
 def test_zimage_cfg_uses_negative_prompt(zimage, tmp_path):

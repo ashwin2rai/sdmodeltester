@@ -4,7 +4,7 @@ Persistent memory for development sessions — read first when resuming, update 
 What the repo must do (incl. all owner decisions) is in `SPEC.md`; this file is how we work,
 where we are, and what we learned.
 
-**Last updated:** 2026-10-17
+**Last updated:** 2026-11-12
 
 ## Working agreement (owner)
 
@@ -39,6 +39,7 @@ where we are, and what we learned.
 | Run the notebook on Colab, fix what reality finds, pin `requirements-inference.txt` ranges | needs Colab |
 | Z-Image Turbo family (`zimage`, SPEC §4a): BF16 + plain FP8 transformer files, tiny-model CPU tests through the real single-file loader | done locally — awaiting owner review; needs Colab |
 | Fix: img2img `from_pipe` upcast SD/SDXL to FP32 (SPEC §4) | done — re-measure SD/SDXL speed/VRAM on Colab |
+| Z-Image continuous img2img strength (SPEC §4a) for light image guidance at 4–5 steps | done locally — awaiting owner review; check strength 0.8–0.95 on Colab |
 
 ## Verified against Colab without a GPU (2026-10-04)
 

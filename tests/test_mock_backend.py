@@ -166,6 +166,18 @@ def test_img2img_progress_counts_denoising_steps(backend, tmp_path):
     assert events[-1] == "denoising 15/15"
 
 
+def test_zimage_img2img_progress_counts_every_step(tmp_path):
+    b = MockBackend("zimage")
+    b.load()
+    events = []
+    req = make_request(
+        input_image=write_input(tmp_path), strength=0.9, steps=4, width=512, height=512,
+        guidance_scale=0.0, sampler="flow_euler",
+    )  # fmt: skip
+    b.generate(resolve_job(req, family="zimage"), tmp_path, lambda f, m: events.append(m))
+    assert events[-1] == "denoising 4/4"
+
+
 # --- OOM fallback / micro-batching ----------------------------------------------
 
 

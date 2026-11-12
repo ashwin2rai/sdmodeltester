@@ -101,6 +101,9 @@ class FamilySpec:
     # and the pipeline encodes the plain prompts itself.
     prompt_weights: bool = True
     denoiser: str = "unet"
+    # True: img2img strength sets the starting noise level directly and every requested
+    # step runs (custom sigmas), instead of Diffusers' int(steps * strength) truncation.
+    continuous_strength: bool = False
 
 
 FAMILIES: dict[str, FamilySpec] = {
@@ -120,6 +123,7 @@ FAMILIES: dict[str, FamilySpec] = {
         dimension_multiple=16,
         prompt_weights=False,
         denoiser="transformer",
+        continuous_strength=True,
     ),
 }
 
@@ -245,6 +249,17 @@ def min_img2img_steps(strength: float) -> int:
     return steps
 
 
+def img2img_sigmas(steps: int, strength: float) -> list[float]:
+    """Unshifted sigmas for a continuous-strength img2img run: ``steps`` evenly spaced values
+    from ``strength`` down to ``strength / steps``.
+
+    Diffusers' default Z-Image schedule is the same with strength 1 (``linspace(1, 1/steps)``);
+    the scheduler applies its shift on top, so strength 0.75 starts at the same noise level
+    as before (90% at shift 3) but any value in between is now reachable.
+    """
+    return [strength * (1 - i / steps) for i in range(steps)]
+
+
 def normalize_request(
     req: GenerationRequest, family: ModelFamily
 ) -> tuple[GenerationRequest, tuple[str, ...]]:
@@ -269,6 +284,7 @@ def normalize_request(
 
     if (
         req.input_image is not None
+        and not FAMILIES[family].continuous_strength
         and _is_int(req.steps)
         and req.steps >= 1
         and _is_number(req.strength)
@@ -335,7 +351,7 @@ def validate_request(req: GenerationRequest, family: ModelFamily) -> None:
         if not _is_number(req.strength) or not 0 < req.strength <= 1:
             raise ValidationError("img2img strength must be greater than 0 and at most 1")
         # Diffusers img2img runs int(steps * strength) denoising steps; zero is an error.
-        if int(req.steps * req.strength) < 1:
+        if not FAMILIES[family].continuous_strength and int(req.steps * req.strength) < 1:
             raise ValidationError(
                 f"strength {req.strength} needs more than {MAX_STEPS} steps to denoise"
             )
@@ -455,9 +471,10 @@ def collision_safe_path(directory: Path, filename: str) -> Path:
     return candidate
 
 
-def denoising_steps(req: GenerationRequest) -> int:
-    """Number of denoising steps the pipeline actually runs (img2img skips the early ones)."""
-    if req.input_image is None:
+def denoising_steps(req: GenerationRequest, family: ModelFamily) -> int:
+    """Number of denoising steps the pipeline actually runs (img2img skips the early ones,
+    except for continuous-strength families)."""
+    if req.input_image is None or FAMILIES[family].continuous_strength:
         return req.steps
     return int(req.steps * req.strength)
 
@@ -653,7 +670,7 @@ class MockBackend(_BatchedBackend):
         self.batch_sizes.append(len(batch))
         if self.max_batch is not None and len(batch) > self.max_batch:
             raise MockOutOfMemory(f"mock OOM at batch size {len(batch)}")
-        total_steps = denoising_steps(req)
+        total_steps = denoising_steps(req, self.family)
         for step in range(1, total_steps + 1):
             time.sleep(self.step_seconds)
             on_step(step, total_steps)
@@ -1063,6 +1080,10 @@ class DiffusersBackend(_BatchedBackend):
         )
         if source is None:
             call_kwargs.update(width=req.width, height=req.height)
+        elif self.spec.continuous_strength:
+            # Strength 1 keeps every step; the custom schedule starts at the chosen noise level.
+            sigmas = img2img_sigmas(req.steps, req.strength)
+            call_kwargs.update(image=[source] * len(batch), strength=1.0, sigmas=sigmas)
         else:
             call_kwargs.update(image=[source] * len(batch), strength=req.strength)
         with torch.inference_mode():

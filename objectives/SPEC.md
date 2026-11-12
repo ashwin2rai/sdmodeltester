@@ -92,6 +92,13 @@ argument, which defaults to float32 — img2img is always built with the pipelin
   single-file converter expects ComfyUI names), non-Z-Image files.
 - img2img is constructed from the loaded components (not `from_pipe`, whose dtype cast would
   undo FP8 storage).
+- **Continuous img2img strength (owner, 2026-11-12)**: Diffusers' `int(steps × strength)`
+  truncation snaps strength to `steps` levels, and the shift-3 schedule crowds them near pure
+  noise: at 4 steps everything above 0.75 was pure noise (image ignored), 0.5–0.75 identical.
+  Instead the backend passes custom sigmas `linspace(strength, strength/steps, steps)` (shifted
+  by the scheduler, so the run starts at `3s/(1+2s)` noise) with pipeline strength 1: every
+  requested step runs and strength is continuous (0.75 → 90% noise, 0.85 → 94%, 0.9 → 96%,
+  0.95 → 98%). No step raising for low strength. UI strength step 0.01.
 - Defaults: 1024×1024, **9 steps** (= 8 transformer passes), **CFG 0** (distilled; CFG > 0
   runs a negative pass), `flow_euler`, strength 0.60. Sizes are multiples of **16**.
 - L4 estimate (unverified): BF16 ≈ 19.3 GiB resident, FP8 ≈ 13.5 GiB, ~1 s/step at 1024².
@@ -143,7 +150,7 @@ Order: validate braces → choose alternatives per image → weighted embeddings
   0..2³²−1 with no wraparound. Corrections are applied silently and logged.
 - **img2img steps (owner)**: Diffusers runs `int(steps × strength)` steps; if that is 0, raise
   steps to the minimum giving one step (A1111-like) and log it. Strength in (0, 1], ignored for
-  txt2img.
+  txt2img. Z-Image is the exception (§4a).
 - Input images: EXIF-orient, RGB, resize (LANCZOS) to cover the target, center-crop — never
   stretch. No fit-mode choice.
 - Outputs: PNG only, no prompt/parameter metadata, no sidecars. Name

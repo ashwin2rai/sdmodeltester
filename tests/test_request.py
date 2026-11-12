@@ -12,6 +12,8 @@ from src.backend import (
     ValidationError,
     check_family,
     collision_safe_path,
+    denoising_steps,
+    img2img_sigmas,
     min_img2img_steps,
     normalize_request,
     output_filename,
@@ -279,3 +281,23 @@ def test_zimage_weight_format_rejects_non_safetensors(tmp_path):
     bad.write_bytes(b"not a safetensors file")
     with pytest.raises(ValueError, match="not a valid"):
         zimage_weight_format(bad)
+
+
+def test_zimage_img2img_strength_is_continuous():
+    # Low strength at few steps is valid as-is: every step runs from a lower noise level.
+    job = resolve_job(
+        zimage_request(input_image=Path("x.png"), strength=0.1, steps=4), family="zimage"
+    )
+    assert job.request.steps == 4
+    assert not any("steps" in note for note in job.corrections)
+    assert denoising_steps(job.request, "zimage") == 4
+    sd = make_request(input_image=Path("x.png"), strength=0.6, steps=25)
+    assert denoising_steps(sd, "sdxl") == 15
+
+
+def test_img2img_sigmas_start_at_strength():
+    assert img2img_sigmas(4, 0.8) == pytest.approx([0.8, 0.6, 0.4, 0.2])
+    assert img2img_sigmas(9, 1.0) == pytest.approx(
+        [1 - i / 9 for i in range(9)]
+    )  # Diffusers default
+    assert img2img_sigmas(4, 0.85)[0] > img2img_sigmas(4, 0.8)[0]  # no snapping between values
